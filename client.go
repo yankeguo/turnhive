@@ -127,11 +127,20 @@ type ModelSpec struct {
 	// Headers carries the authentication header and any extra headers
 	// sent to the endpoint.
 	Headers map[string]string `json:"headers,omitempty"`
+	// MaxContext is the model's context window size in tokens; zero
+	// means unspecified.
+	MaxContext int `json:"max_context,omitempty"`
+	// Features declares model capabilities; see the ModelFeature* constants.
+	Features []string `json:"features,omitempty"`
 }
 
 // ProtocolOpenAICompletions is the only model protocol currently
 // supported.
 const ProtocolOpenAICompletions = "openai_completions"
+
+// ModelFeatureSupportImage marks a model that accepts image inputs. It
+// enables image-related tooling (e.g. load_media) for the session.
+const ModelFeatureSupportImage = "support_image"
 
 // PromptSpec holds the session's prompt materials.
 type PromptSpec struct {

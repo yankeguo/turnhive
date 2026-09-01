@@ -277,3 +277,31 @@ func TestStreamContextCancellation(t *testing.T) {
 		t.Errorf("error = %v, want context.Canceled", err)
 	}
 }
+
+func TestMessageImagesWire(t *testing.T) {
+	// A user message with images marshals as a content-part array.
+	msg := Message{Role: "user", Content: "what is this?", Images: []string{"data:image/png;base64,AAAA"}}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(raw)
+	if !strings.Contains(s, `"type":"text"`) || !strings.Contains(s, `"type":"image_url"`) || !strings.Contains(s, `"url":"data:image/png;base64,AAAA"`) {
+		t.Fatalf("unexpected wire form: %s", s)
+	}
+
+	// Round-trip: text parts concatenate, image parts collect.
+	var back Message
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Content != "what is this?" || len(back.Images) != 1 || back.Images[0] != "data:image/png;base64,AAAA" {
+		t.Fatalf("round-trip mismatch: %+v", back)
+	}
+
+	// Text-only messages keep the plain-string content form.
+	raw, _ = json.Marshal(Message{Role: "user", Content: "hi"})
+	if !strings.Contains(string(raw), `"content":"hi"`) {
+		t.Fatalf("text message must use string content: %s", raw)
+	}
+}

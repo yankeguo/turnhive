@@ -3,17 +3,18 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/oklog/ulid/v2"
 	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/agent"
 	"github.com/yankeguo/turnhive/registry"
@@ -118,9 +119,7 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	id := hex.EncodeToString(b[:])
+	id := "sess-" + strings.ToLower(ulid.Make().String())
 
 	sess := &Session{ID: id, Spec: req, Sandbox: sandbox}
 	externalTools := make([]agent.ExternalToolSpec, 0, len(req.Tools))
@@ -133,6 +132,7 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		ModelName:     req.Model.Name,
 		SystemPrompt:  agent.BuildSystemPrompt(req.Prompt.System, skillRefs, skillsRoot),
 		Sandbox:       sandbox,
+		SupportImage:  slices.Contains(req.Model.Features, ModelFeatureSupportImage),
 		ExternalTools: externalTools,
 		Waiter:        sess,
 		History:       agent.S3History(c.store, id),

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -430,6 +431,69 @@ func TestLoopStreamErrorPersistsPartial(t *testing.T) {
 	saved := hist.lastSaved()
 	if len(saved) != 2 || saved[0].Role != "user" || saved[1].Role != "assistant" || saved[1].Content != "partial" {
 		t.Fatalf("expected partial text persisted, got %+v", saved)
+	}
+}
+
+func TestLoopLoadMedia(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	st := newSandboxTools(sb)
+	if err := st.sb.PutFile(context.Background(), "dot.png", bytes.NewReader(tinyPNG), nil); err != nil {
+		t.Fatalf("put image: %v", err)
+	}
+	fs := &fakeStream{}
+	fs.toolCallReply(llm.ToolCall{ID: "c1", Name: "load_media", Arguments: json.RawMessage(`{"file_path": "dot.png"}`)})
+	fs.textReply("a single pixel")
+	l := newTestLoop(LoopConfig{ModelName: "test-model", Sandbox: sb, SupportImage: true}, fs)
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "look at dot.png", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if !r.doneCalled || r.doneText != "a single pixel" {
+		t.Fatalf("expected Done, got %+v", r)
+	}
+
+	// The second request carries the tool message followed by a user
+	// message with the image.
+	req := fs.lastRequest()
+	toolIdx, imageIdx := -1, -1
+	for i, m := range req.Messages {
+		if m.Role == "tool" && m.ToolCallID == "c1" {
+			toolIdx = i
+		}
+		if m.Role == "user" && len(m.Images) == 1 {
+			imageIdx = i
+		}
+	}
+	if toolIdx < 0 || imageIdx != toolIdx+1 {
+		t.Fatalf("expected image user message right after the tool message, got %+v", req.Messages)
+	}
+	if !strings.Contains(req.Messages[toolIdx].Content, "Image loaded: dot.png") {
+		t.Fatalf("unexpected tool result %q", req.Messages[toolIdx].Content)
+	}
+	if !strings.HasPrefix(req.Messages[imageIdx].Images[0], "data:image/png;base64,") {
+		t.Fatalf("unexpected image %q", req.Messages[imageIdx].Images[0][:64])
+	}
+
+	// The image exchange is transient: history holds only the final
+	// {user, assistant} pair without images.
+	if msgs := l.Messages(); len(msgs) != 2 || len(msgs[1].Images) != 0 {
+		t.Fatalf("history must not carry images: %+v", msgs)
+	}
+}
+
+func TestLoopLoadMediaGated(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	fs := &fakeStream{}
+	fs.textReply("ok")
+	l := newTestLoop(LoopConfig{ModelName: "test-model", Sandbox: sb}, fs)
+	if err := l.RunTurn(context.Background(), "hi", &fakeReporter{}); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	for _, td := range fs.lastRequest().Tools {
+		if td.Name == "load_media" {
+			t.Fatalf("load_media must not be advertised without support_image")
+		}
 	}
 }
 

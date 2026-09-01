@@ -103,6 +103,20 @@ type ModelSpec struct {
 	// Headers carries the authentication header and any extra headers
 	// sent to the endpoint.
 	Headers map[string]string `json:"headers"`
+	// MaxContext is the model's context window size in tokens; zero
+	// means unspecified.
+	MaxContext int `json:"max_context,omitempty"`
+	// Features declares model capabilities; see the ModelFeature* constants.
+	Features []string `json:"features,omitempty"`
+}
+
+// ModelFeatureSupportImage marks a model that accepts image inputs. It
+// enables image-related tooling (e.g. load_media) for the session.
+const ModelFeatureSupportImage = "support_image"
+
+// modelFeatures is the set of currently recognized ModelSpec.Features values.
+var modelFeatures = map[string]bool{
+	ModelFeatureSupportImage: true,
 }
 
 // PromptSpec holds the session's prompt materials.
@@ -186,6 +200,14 @@ func (r *CreateSessionRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.Model.Name) == "" {
 		return fmt.Errorf("model.name is required")
+	}
+	if r.Model.MaxContext < 0 {
+		return fmt.Errorf("model.max_context must not be negative")
+	}
+	for i, f := range r.Model.Features {
+		if !modelFeatures[f] {
+			return fmt.Errorf("model.features[%d]: unknown feature %q (supported: %s)", i, f, ModelFeatureSupportImage)
+		}
 	}
 	if strings.TrimSpace(r.Prompt.System) == "" {
 		return fmt.Errorf("prompt.system is required")

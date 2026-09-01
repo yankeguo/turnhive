@@ -66,21 +66,27 @@ type sandboxTools struct {
 // .agents/skills tree is read-only. Absolute paths are passed through
 // untouched — the sandbox is single-use and disposable.
 func SandboxTools(sb *ironhive.Sandbox) []Tool {
-	return newSandboxTools(sb).list()
+	return newSandboxTools(sb).list(false)
 }
 
 func newSandboxTools(sb *ironhive.Sandbox) *sandboxTools {
 	return &sandboxTools{sb: sb}
 }
 
-func (t *sandboxTools) list() []Tool {
-	return []Tool{
+// list returns the sandbox tools; load_media is included only when
+// withMedia is set (the session's model declares support_image).
+func (t *sandboxTools) list(withMedia bool) []Tool {
+	tools := []Tool{
 		sandboxRead{t},
 		sandboxWrite{t},
 		sandboxEdit{t},
 		sandboxApplyPatch{t},
 		sandboxShell{t},
 	}
+	if withMedia {
+		tools = append(tools, sandboxLoadMedia{t})
+	}
+	return tools
 }
 
 // SpillOutput implements OutputSpiller: oversized tool output is written

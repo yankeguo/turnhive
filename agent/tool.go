@@ -18,6 +18,17 @@ type Tool interface {
 	Execute(ctx context.Context, callID string, args json.RawMessage) (string, error)
 }
 
+// ImageTool is a Tool whose execution can additionally yield images for
+// the model (e.g. load_media). The loop injects the returned image data
+// URIs into the conversation as a user message right after the tool
+// message. Only implement it for models that accept image inputs.
+type ImageTool interface {
+	Tool
+	// ExecuteImage runs one call like Execute, additionally returning
+	// image data URIs to inject into the conversation.
+	ExecuteImage(ctx context.Context, callID string, args json.RawMessage) (text string, images []string, err error)
+}
+
 // selfTruncatingTool marks a Tool that bounds its own output (read);
 // dispatchTool skips the generic spill/truncation for such tools.
 type selfTruncatingTool interface {
@@ -28,22 +39,28 @@ type selfTruncatingTool interface {
 // Successful output goes through TruncateSpill — oversized output is
 // spilled to a sandbox file and only a strict head preview plus the file
 // path goes back to the model — unless the tool bounds its own output.
-// Errors are returned untruncated (the caller feeds them back as the
-// tool result text).
-func dispatchTool(ctx context.Context, tools []Tool, spiller OutputSpiller, callID, name string, args json.RawMessage) (string, error) {
+// Images returned by an ImageTool pass through untouched. Errors are
+// returned untruncated (the caller feeds them back as the tool result
+// text).
+func dispatchTool(ctx context.Context, tools []Tool, spiller OutputSpiller, callID, name string, args json.RawMessage) (text string, images []string, err error) {
 	for _, t := range tools {
-		if t.Spec().Name == name {
-			out, err := t.Execute(ctx, callID, args)
-			if err != nil {
-				return "", err
-			}
-			if _, ok := t.(selfTruncatingTool); ok {
-				return out, nil
-			}
-			return TruncateSpill(ctx, out, name, spiller), nil
+		if t.Spec().Name != name {
+			continue
 		}
+		if it, ok := t.(ImageTool); ok {
+			text, images, err = it.ExecuteImage(ctx, callID, args)
+		} else {
+			text, err = t.Execute(ctx, callID, args)
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if _, ok := t.(selfTruncatingTool); ok {
+			return text, images, nil
+		}
+		return TruncateSpill(ctx, text, name, spiller), images, nil
 	}
-	return "", fmt.Errorf("unknown tool: %s", name)
+	return "", nil, fmt.Errorf("unknown tool: %s", name)
 }
 
 // toolSpecs returns the tool definitions of tools, in order.

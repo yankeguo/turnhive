@@ -31,7 +31,9 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
     "url": "https://api.example.com/v1/chat/completions", // 推理端点完整 URL
     "protocol": "openai_completions",                     // 当前固定
     "name": "my-model",
-    "headers": {"Authorization": "Bearer ..."}            // 认证头和其他额外头
+    "headers": {"Authorization": "Bearer ..."},           // 认证头和其他额外头
+    "max_context": 131072,                                // 可选；模型上下文窗口（tokens）
+    "features": ["support_image"]                            // 可选；能力标记，当前仅 support_image
   },
   "prompt": {"system": "you are an agent"},               // 系统提示词
   "ironhive": {"pool": "default"},                        // 沙箱池
@@ -74,7 +76,7 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 集群内部能力（对客户端不可见）：
 
 - 大模型调用（OpenAI-compatible 流式端点）
-- 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）
+- 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）
 - 子 session 创建与结果汇聚（二期）
 
 ## 客户端用法

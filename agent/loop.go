@@ -34,6 +34,9 @@ type LoopConfig struct {
 	// Sandbox is the session's ironhive sandbox; nil disables the
 	// sandbox tools.
 	Sandbox *ironhive.Sandbox
+	// SupportImage enables the load_media tool (requires Sandbox); set it
+	// when the model accepts image inputs.
+	SupportImage bool
 	// ExternalTools are the client-defined tools executed externally.
 	ExternalTools []ExternalToolSpec
 	// Waiter supplies the results of external tool calls.
@@ -66,7 +69,7 @@ func NewLoop(cfg LoopConfig) *Loop {
 	l := &Loop{cfg: cfg, stream: llm.Stream}
 	if cfg.Sandbox != nil {
 		st := newSandboxTools(cfg.Sandbox)
-		l.tools = append(l.tools, st.list()...)
+		l.tools = append(l.tools, st.list(cfg.SupportImage)...)
 		l.spiller = st
 	}
 	l.tools = append(l.tools, ExternalTools(cfg.ExternalTools, cfg.Waiter, cfg.ExternalToolTimeout)...)
@@ -144,7 +147,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		working = append(working, msg)
 		for _, tc := range msg.ToolCalls {
 			r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallRunning})
-			out, err := dispatchTool(ctx, l.tools, l.spiller, tc.ID, tc.Name, tc.Arguments)
+			out, images, err := dispatchTool(ctx, l.tools, l.spiller, tc.ID, tc.Name, tc.Arguments)
 			var resultText string
 			if err != nil {
 				r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallError})
@@ -154,6 +157,12 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 				resultText = out
 			}
 			working = append(working, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: resultText})
+			// Images a tool produced (load_media) follow their tool
+			// message as a user message with image_url parts — chat
+			// completions only accepts images on user messages.
+			if len(images) > 0 {
+				working = append(working, llm.Message{Role: "user", Images: images})
+			}
 		}
 	}
 

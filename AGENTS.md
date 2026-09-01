@@ -60,3 +60,4 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 - shell 是有状态的：ironhive 每次调用经 cwd/env 事件上报执行后的工作目录与全量环境，turnhive 在下一次前台调用回传（`strict_env`），因此 `cd`/`export` 在 session 内跨调用保持（仅前台完成的调用更新状态）。
 - shell 输出从启动即重定向到沙盒 `.agents/shell-logs/<callID>.{stdout,stderr,exit}`（真实退出码在 .exit 文件，SSE exit 事件只是兜底）：前台调用完成后读回，字节精确；30s 前台窗口到期或 `bg: true` 时不杀进程转后台，回报 pid（ironhive pid 事件，即 pgid）+ 输出文件路径，模型用 `tail/cat` 轮询、`kill -- -<pid>` 杀整组。后台进程不回传状态，随沙盒销毁。
 - 工具输出分两级截断（参考 agentdesk runner）：`read` 自带 2000 行/50KB 预算自行截断；其他工具走更严格的 500 行/16KB，超限完整输出由 `OutputSpiller` 写入沙盒 `./.agents/tool-results/<tool>-NNNN.txt`，模型只收到 head 预览 + 文件路径 + 读取提示（spill 失败退化为普通截断）。
+- `load_media` 仅在 `model.features` 含 `support_image` 时挂载（`ImageTool.ExecuteImage` 返回 data URI）；图片紧跟其 tool 消息以 user 消息（image_url parts）注入下一轮请求——chat completions 只在 user 消息接受图片；图片是瞬态的，不入历史。

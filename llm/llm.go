@@ -32,16 +32,35 @@ type Message struct {
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallID string
+	// Images carries image data URIs of a user message, emitted as
+	// image_url content parts alongside the text (e.g. the load_media
+	// tool's output injected for a vision model). Transient by design:
+	// never persisted to history.
+	Images []string
 }
 
-// messageWire is the JSON wire form of Message. Content is always emitted
-// as a string ("" when empty); tool call arguments are strings holding the
-// JSON document, per the OpenAI function calling convention.
+// messageWire is the JSON wire form of Message. Content is a plain
+// string for text-only messages and a content-part array when Images are
+// present; tool call arguments are strings holding the JSON document,
+// per the OpenAI function calling convention.
 type messageWire struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
-	ToolCalls  []toolCallWire `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role       string          `json:"role"`
+	Content    any             `json:"content"`
+	ToolCalls  []toolCallWire  `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+}
+
+// contentPart is one part of a multipart message content array.
+type contentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *imageURLPart `json:"image_url,omitempty"`
+}
+
+// imageURLPart is an image_url content part; the URL is usually a data
+// URI.
+type imageURLPart struct {
+	URL string `json:"url"`
 }
 
 type toolCallWire struct {
@@ -57,8 +76,19 @@ type toolCallWire struct {
 func (m Message) MarshalJSON() ([]byte, error) {
 	wire := messageWire{
 		Role:       m.Role,
-		Content:    m.Content,
 		ToolCallID: m.ToolCallID,
+	}
+	if len(m.Images) == 0 {
+		wire.Content = m.Content
+	} else {
+		var parts []contentPart
+		if m.Content != "" {
+			parts = append(parts, contentPart{Type: "text", Text: m.Content})
+		}
+		for _, u := range m.Images {
+			parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURLPart{URL: u}})
+		}
+		wire.Content = parts
 	}
 	for _, tc := range m.ToolCalls {
 		var w toolCallWire
@@ -71,15 +101,42 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	return json.Marshal(wire)
 }
 
-// UnmarshalJSON decodes the OpenAI wire format into m.
+// UnmarshalJSON decodes the OpenAI wire format into m. Content is
+// accepted both as a plain string and as a content-part array (text
+// parts are concatenated, image_url parts collected into Images).
 func (m *Message) UnmarshalJSON(data []byte) error {
-	var wire messageWire
+	var wire struct {
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		ToolCalls  []toolCallWire  `json:"tool_calls,omitempty"`
+		ToolCallID string          `json:"tool_call_id,omitempty"`
+	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
 	m.Role = wire.Role
-	m.Content = wire.Content
 	m.ToolCallID = wire.ToolCallID
+	m.Content = ""
+	m.Images = nil
+	if len(wire.Content) > 0 && string(wire.Content) != "null" {
+		var text string
+		if err := json.Unmarshal(wire.Content, &text); err == nil {
+			m.Content = text
+		} else {
+			var parts []contentPart
+			if err := json.Unmarshal(wire.Content, &parts); err != nil {
+				return fmt.Errorf("decode message content: %w", err)
+			}
+			for _, p := range parts {
+				if p.Type == "text" {
+					m.Content += p.Text
+				}
+				if p.Type == "image_url" && p.ImageURL != nil {
+					m.Images = append(m.Images, p.ImageURL.URL)
+				}
+			}
+		}
+	}
 	m.ToolCalls = nil
 	for _, w := range wire.ToolCalls {
 		m.ToolCalls = append(m.ToolCalls, ToolCall{
