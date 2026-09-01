@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -15,6 +16,12 @@ type EventType string
 
 // Stream event types, matching the turnhive SSE event names.
 const (
+	// EventSync is the control event delivered on connect: Event.TurnID
+	// is the currently running turn ("" when idle), Event.Seq the latest
+	// sequence number and Event.Messages the full merged history.
+	EventSync EventType = "sync"
+	// EventTurnStarted marks the beginning of a turn (Event.TurnID).
+	EventTurnStarted EventType = "turn_started"
 	// EventDelta carries one assistant content delta in Event.Text.
 	EventDelta EventType = "delta"
 	// EventReasoningDelta carries one reasoning content delta in
@@ -36,27 +43,44 @@ const (
 	ToolCallError   = "error"
 )
 
-// Event is one event of a turn stream. The meaningful fields depend on
-// Type; see the EventType constants.
+// Event is one event of the session event stream. The meaningful fields
+// depend on Type; see the EventType constants. TurnID identifies the
+// turn the event belongs to, Seq is its per-session sequence number
+// (pass it back as Events' lastSeq after a reconnect).
 type Event struct {
 	Type    EventType
-	Text    string // delta, reasoning_delta, done
-	ID      string // tool_call
-	Name    string // tool_call
-	Title   string // tool_call, optional
-	Status  string // tool_call: ToolCallRunning / ToolCallDone / ToolCallError
-	Message string // error
+	Seq     int64
+	TurnID  string
+	Text    string        // delta, reasoning_delta, done
+	ID      string        // tool_call
+	Name    string        // tool_call
+	Title   string        // tool_call, optional
+	Status  string        // tool_call: ToolCallRunning / ToolCallDone / ToolCallError
+	Message string        // error
+	// Messages is the full merged history carried by the sync event
+	// (completed turns as {user, assistant} pairs); empty for all other
+	// event types.
+	Messages []SyncMessage
+}
+
+// SyncMessage is one message of the merged history in a sync event.
+type SyncMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // eventPayload is the JSON data carried by one SSE event; every event
 // kind decodes from the same flat shape.
 type eventPayload struct {
-	Text    string `json:"text"`
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Title   string `json:"title"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	TurnID   string        `json:"turn_id"`
+	Seq      int64         `json:"seq"`
+	Text     string        `json:"text"`
+	ID       string        `json:"id"`
+	Name     string        `json:"name"`
+	Title    string        `json:"title"`
+	Status   string        `json:"status"`
+	Message  string        `json:"message"`
+	Messages []SyncMessage `json:"messages"`
 }
 
 // Stream is the event stream of one turn, returned by SendMessage.
@@ -119,8 +143,9 @@ func (s *Stream) run() {
 	reader := bufio.NewReader(s.body)
 	var name string
 	var data strings.Builder
+	var frameSeq int64
 	dispatch := func() bool {
-		defer func() { name, data = "", strings.Builder{} }()
+		defer func() { name, data, frameSeq = "", strings.Builder{}, 0 }()
 		if data.Len() == 0 {
 			return true
 		}
@@ -129,14 +154,23 @@ func (s *Stream) run() {
 			s.finish(fmt.Errorf("malformed event data %q: %w", truncate(data.String(), 256), err))
 			return false
 		}
+		seq := frameSeq
+		if seq == 0 {
+			// Control events without a frame id (sync) carry their seq in
+			// the payload.
+			seq = p.Seq
+		}
 		s.events <- Event{
 			Type:    EventType(name),
+			Seq:     seq,
+			TurnID:  p.TurnID,
 			Text:    p.Text,
 			ID:      p.ID,
 			Name:    p.Name,
 			Title:   p.Title,
 			Status:  p.Status,
 			Message: p.Message,
+			Messages: p.Messages,
 		}
 		return true
 	}
@@ -148,7 +182,7 @@ func (s *Stream) run() {
 				// EOF may arrive with a final partial line, and the last
 				// event may lack its trailing blank line.
 				if len(strings.TrimSpace(line)) > 0 {
-					parseLine(line, &name, &data)
+					parseLine(line, &name, &data, &frameSeq)
 				}
 				if !dispatch() {
 					return
@@ -168,18 +202,22 @@ func (s *Stream) run() {
 			}
 			continue
 		}
-		parseLine(line, &name, &data)
+		parseLine(line, &name, &data, &frameSeq)
 	}
 }
 
-// parseLine folds one SSE line into the pending event name and data.
-// Comment lines (": ...") and unknown fields are ignored.
-func parseLine(line string, name *string, data *strings.Builder) {
+// parseLine folds one SSE line into the pending event name, data and
+// frame id. Comment lines (": ...") and unknown fields are ignored.
+func parseLine(line string, name *string, data *strings.Builder, frameSeq *int64) {
 	if strings.HasPrefix(line, ":") {
 		return
 	}
 	if v, ok := strings.CutPrefix(line, "event:"); ok {
 		*name = strings.TrimPrefix(v, " ")
+		return
+	}
+	if v, ok := strings.CutPrefix(line, "id:"); ok {
+		*frameSeq, _ = strconv.ParseInt(strings.TrimPrefix(v, " "), 10, 64)
 		return
 	}
 	if v, ok := strings.CutPrefix(line, "data:"); ok {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ func TestCreateSession(t *testing.T) {
 			t.Errorf("unexpected request: %+v", req)
 		}
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":"abc123"}`))
+		_, _ = w.Write([]byte(`{"id":"sess-abc"}`))
 	}))
 	defer done()
 
@@ -49,7 +50,7 @@ func TestCreateSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if sess.ID != "abc123" {
+	if sess.ID != "sess-abc" {
 		t.Fatalf("unexpected session id %q", sess.ID)
 	}
 }
@@ -83,7 +84,7 @@ func TestDeleteSessionNotFound(t *testing.T) {
 	}
 }
 
-func TestSendMessageStream(t *testing.T) {
+func TestSendMessage(t *testing.T) {
 	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/sessions/s1/messages" {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
@@ -94,48 +95,17 @@ func TestSendMessageStream(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Content != "hello" {
 			t.Errorf("unexpected message request: %v", err)
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		// Keepalive comments and blank lines must be skipped; the final
-		// event arrives without a trailing blank line.
-		fmt.Fprint(w, ": keepalive\n\n")
-		fmt.Fprint(w, "event: reasoning_delta\ndata: {\"text\":\"thinking\"}\n\n")
-		fmt.Fprint(w, "event: delta\ndata: {\"text\":\"Hel\"}\n\n")
-		fmt.Fprint(w, "event: delta\ndata: {\"text\":\"lo\"}\n\n")
-		fmt.Fprint(w, "event: tool_call\ndata: {\"id\":\"c1\",\"name\":\"shell\",\"status\":\"running\"}\n\n")
-		fmt.Fprint(w, "event: tool_call\ndata: {\"id\":\"c1\",\"name\":\"shell\",\"status\":\"done\"}\n\n")
-		fmt.Fprint(w, "event: done\ndata: {\"text\":\"Hello\"}\n")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"turn_id":"turn-abc"}`))
 	}))
 	defer done()
 
-	stream, err := cli.SendMessage(context.Background(), "s1", "hello")
+	turnID, err := cli.SendMessage(context.Background(), "s1", "hello")
 	if err != nil {
 		t.Fatalf("send message: %v", err)
 	}
-
-	var events []Event
-	for ev := range stream.Events() {
-		events = append(events, ev)
-	}
-	if err := stream.Err(); err != nil {
-		t.Fatalf("stream error: %v", err)
-	}
-
-	want := []Event{
-		{Type: EventReasoningDelta, Text: "thinking"},
-		{Type: EventDelta, Text: "Hel"},
-		{Type: EventDelta, Text: "lo"},
-		{Type: EventToolCall, ID: "c1", Name: "shell", Status: ToolCallRunning},
-		{Type: EventToolCall, ID: "c1", Name: "shell", Status: ToolCallDone},
-		{Type: EventDone, Text: "Hello"},
-	}
-	if len(events) != len(want) {
-		t.Fatalf("got %d events, want %d: %+v", len(events), len(want), events)
-	}
-	for i := range want {
-		if events[i] != want[i] {
-			t.Errorf("event %d: got %+v, want %+v", i, events[i], want[i])
-		}
+	if turnID != "turn-abc" {
+		t.Fatalf("unexpected turn id %q", turnID)
 	}
 }
 
@@ -152,22 +122,97 @@ func TestSendMessageBusy(t *testing.T) {
 	}
 }
 
-func TestSendMessageServerErrorEvent(t *testing.T) {
+// serveEvents writes one canned event-stream response: a sync frame, a
+// turn's events with sequence ids and turn ids, and keepalive comments.
+func serveEvents(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "id: 4\nevent: sync\ndata: {\"turn_id\":\"turn-abc\",\"seq\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]}\n\n")
+	fmt.Fprint(w, ": keepalive\n\n")
+	fmt.Fprint(w, "id: 1\nevent: turn_started\ndata: {\"turn_id\":\"turn-abc\"}\n\n")
+	fmt.Fprint(w, "id: 2\nevent: delta\ndata: {\"turn_id\":\"turn-abc\",\"text\":\"Hel\"}\n\n")
+	fmt.Fprint(w, "id: 3\nevent: tool_call\ndata: {\"turn_id\":\"turn-abc\",\"id\":\"c1\",\"name\":\"shell\",\"status\":\"running\"}\n\n")
+	fmt.Fprint(w, "id: 4\nevent: done\ndata: {\"turn_id\":\"turn-abc\",\"text\":\"Hello\"}\n")
+}
+
+func TestEventsStream(t *testing.T) {
 	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "event: error\ndata: {\"message\":\"boom\"}\n\n")
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/sessions/s1/events" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		serveEvents(w)
 	}))
 	defer done()
 
-	stream, err := cli.SendMessage(context.Background(), "s1", "hi")
+	stream, err := cli.Events(context.Background(), "s1", 0)
 	if err != nil {
-		t.Fatalf("send message: %v", err)
+		t.Fatalf("events: %v", err)
+	}
+
+	var events []Event
+	for ev := range stream.Events() {
+		events = append(events, ev)
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+
+	want := []Event{
+		{Type: EventSync, Seq: 4, TurnID: "turn-abc", Messages: []SyncMessage{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", Content: "hello"},
+		}},
+		{Type: EventTurnStarted, Seq: 1, TurnID: "turn-abc"},
+		{Type: EventDelta, Seq: 2, TurnID: "turn-abc", Text: "Hel"},
+		{Type: EventToolCall, Seq: 3, TurnID: "turn-abc", ID: "c1", Name: "shell", Status: ToolCallRunning},
+		{Type: EventDone, Seq: 4, TurnID: "turn-abc", Text: "Hello"},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("got %d events, want %d: %+v", len(events), len(want), events)
+	}
+	for i := range want {
+		if !reflect.DeepEqual(events[i], want[i]) {
+			t.Errorf("event %d: got %+v, want %+v", i, events[i], want[i])
+		}
+	}
+}
+
+func TestEventsResumePassesLastSeq(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("last_seq"); got != "42" {
+			t.Errorf("expected last_seq=42, got %q", got)
+		}
+		serveEvents(w)
+	}))
+	defer done()
+
+	stream, err := cli.Events(context.Background(), "s1", 42)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	for range stream.Events() {
+	}
+	if err := stream.Err(); err != nil {
+		t.Fatalf("stream error: %v", err)
+	}
+}
+
+func TestEventsServerErrorEvent(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "id: 7\nevent: error\ndata: {\"turn_id\":\"turn-abc\",\"message\":\"boom\"}\n\n")
+	}))
+	defer done()
+
+	stream, err := cli.Events(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
 	}
 	ev, ok := <-stream.Events()
 	if !ok {
 		t.Fatal("stream closed without events")
 	}
-	if ev.Type != EventError || ev.Message != "boom" {
+	if ev.Type != EventError || ev.Message != "boom" || ev.Seq != 7 || ev.TurnID != "turn-abc" {
 		t.Fatalf("unexpected event: %+v", ev)
 	}
 	for range stream.Events() {
@@ -190,9 +235,9 @@ func TestStreamClose(t *testing.T) {
 	defer done()
 	defer close(release)
 
-	stream, err := cli.SendMessage(context.Background(), "s1", "hi")
+	stream, err := cli.Events(context.Background(), "s1", 0)
 	if err != nil {
-		t.Fatalf("send message: %v", err)
+		t.Fatalf("events: %v", err)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -201,6 +246,39 @@ func TestStreamClose(t *testing.T) {
 	}
 	if stream.Err() != nil {
 		t.Fatalf("stream error after Close: %v", stream.Err())
+	}
+}
+
+func TestEventsContextCancel(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done() // block until the client goes away
+	}))
+	defer done()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := cli.Events(ctx, "s1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	cancel()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-stream.Events():
+			if !ok {
+				if stream.Err() == nil {
+					t.Fatal("expected stream error after cancel")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("stream did not end after cancel")
+		}
 	}
 }
 
@@ -248,42 +326,9 @@ func TestReportToolError(t *testing.T) {
 	}
 }
 
-func TestSendMessageContextCancel(t *testing.T) {
-	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		<-r.Context().Done() // block until the client goes away
-	}))
-	defer done()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := cli.SendMessage(ctx, "s1", "hi")
-	if err != nil {
-		t.Fatalf("send message: %v", err)
-	}
-	cancel()
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case _, ok := <-stream.Events():
-			if !ok {
-				if stream.Err() == nil {
-					t.Fatal("expected stream error after cancel")
-				}
-				return
-			}
-		case <-deadline:
-			t.Fatal("stream did not end after cancel")
-		}
-	}
-}
-
 func TestEventStringContainsNoSecrets(t *testing.T) {
 	// Sanity check: Event is comparable and printable.
-	ev := Event{Type: EventToolCall, ID: "c1", Name: "shell", Status: ToolCallRunning}
+	ev := Event{Type: EventToolCall, Seq: 3, TurnID: "turn-abc", ID: "c1", Name: "shell", Status: ToolCallRunning}
 	if !strings.Contains(fmt.Sprintf("%+v", ev), "shell") {
 		t.Fatal("unexpected event rendering")
 	}

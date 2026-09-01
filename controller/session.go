@@ -25,16 +25,56 @@ type Session struct {
 	Sandbox *ironhive.Sandbox
 	// Loop runs the agent turns of this session.
 	Loop *agent.Loop
+	// hub sequences, buffers and fans out the session's events (see
+	// hub.go).
+	hub *eventHub
 	// stopRenew cancels the sandbox lease renewal loop of this session.
 	stopRenew context.CancelFunc
 
 	mu sync.Mutex
+	// turnID is the currently running turn ("" when idle); turns run
+	// detached from the HTTP request that started them.
+	turnID string
+	// turnCancel cancels the running turn (DELETE session, node
+	// shutdown).
+	turnCancel context.CancelFunc
 	// pending holds tool results that arrived before the agent loop
 	// started waiting for them.
 	pending map[string]ToolResultRequest
 	// waiters holds the channels of tool calls the agent loop is
 	// currently blocked on.
 	waiters map[string]chan ToolResultRequest
+}
+
+// startTurn marks a new turn as running, returning false when one is
+// already running (the session allows one turn at a time).
+func (s *Session) startTurn(turnID string, cancel context.CancelFunc) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnID != "" {
+		return false
+	}
+	s.turnID = turnID
+	s.turnCancel = cancel
+	return true
+}
+
+// finishTurn clears the running-turn mark when a turn ends.
+func (s *Session) finishTurn() {
+	s.mu.Lock()
+	s.turnID = ""
+	s.turnCancel = nil
+	s.mu.Unlock()
+}
+
+// cancelTurn aborts the running turn, if any.
+func (s *Session) cancelTurn() {
+	s.mu.Lock()
+	cancel := s.turnCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // AddToolResult delivers an externally reported tool result, either to a

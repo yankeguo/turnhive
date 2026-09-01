@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -196,23 +197,38 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 	return c.do(ctx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(sessionID), nil, nil)
 }
 
-// SendMessage sends one user input to the session and returns the turn's
-// event stream. The stream must be drained (or closed) to release the
-// connection. A session runs one turn at a time; a concurrent turn is
+// SendMessage sends one user input to the session and returns the id of
+// the turn it started. The turn runs asynchronously; its events (and
+// those of later turns) are consumed from the session event stream —
+// see Events. A session runs one turn at a time; a concurrent turn is
 // rejected with ErrSessionBusy.
-func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (*Stream, error) {
-	body, err := json.Marshal(struct {
-		Content string `json:"content"`
-	}{Content: content})
-	if err != nil {
-		return nil, fmt.Errorf("marshal message: %w", err)
+func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (string, error) {
+	var resp struct {
+		TurnID string `json:"turn_id"`
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/v1/sessions/"+url.PathEscape(sessionID)+"/messages", bytes.NewReader(body))
+	body := struct {
+		Content string `json:"content"`
+	}{Content: content}
+	if err := c.do(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/messages", body, &resp); err != nil {
+		return "", err
+	}
+	return resp.TurnID, nil
+}
+
+// Events opens the session event stream (GET .../events). Events from
+// all turns flow over it, sequenced per session; pass the last seen
+// Event.Seq as lastSeq to replay what was missed after a reconnect (0
+// replays the retained buffer). The stream must be drained (or closed)
+// to release the connection.
+func (c *Client) Events(ctx context.Context, sessionID string, lastSeq int64) (*Stream, error) {
+	u := c.baseURL + "/v1/sessions/" + url.PathEscape(sessionID) + "/events"
+	if lastSeq > 0 {
+		u += "?last_seq=" + strconv.FormatInt(lastSeq, 10)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := c.hc.Do(req)
@@ -220,7 +236,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (*S
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("send message: %w", err)
+		return nil, fmt.Errorf("session events: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()

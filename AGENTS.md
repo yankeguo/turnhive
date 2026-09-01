@@ -51,10 +51,10 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 
 ## 关键设计（改动前必读）
 
-- session 同时只允许一个进行中的 turn，并发返回 409 `session_busy`。
-- 沙盒租约在 session 存活期间由 controller 按 lease/2 间隔自动续约；DELETE session 和优雅关闭（`Controller.Close`）都会停止续约并释放沙盒——新增 session 生命周期路径时必须维护这两条清理路径。
+- session 同时只允许一个进行中的 turn，并发 POST messages 返回 409 `session_busy`。
+- turn 异步执行：`POST messages` 立即返回 202 + turn_id，turn 在后台 goroutine 运行（脱离 POST 请求生命周期）；事件经独立通道 `GET .../events`（SSE）下发——eventHub 按 session 单调 seq、保留最近 2000 条缓冲、连接先发 `sync`（当前 turn + 最新 seq + 合并后的全部历史消息，取自 Loop 的 {user, assistant} 历史）、支持 `last_seq`/`Last-Event-ID` 断点重放、慢订阅者丢弃（客户端带 last_seq 重连自愈）；事件一律带 `turn_id` 供关联。
+- 沙盒租约在 session 存活期间由 controller 按 lease/2 间隔自动续约；DELETE session 和优雅关闭（`Controller.Close`）都会先取消运行中的 turn、停止续约并释放沙盒——新增 session 生命周期路径时必须维护这两条清理路径。
 - 跨节点路由靠 etcd 归属记录 + `X-Turnhive-Forwarded` 头防转发循环；已转发的请求绝不二次转发。
-- SSE 响应头延迟到首个事件才写入，使 `session_busy` 等错误仍能以纯 JSON 返回。
 - LLM 历史只持久化 {user, assistant} 对（S3 JSONL），tool 交互是 turn 内瞬态。
 - 沙箱路径一律相对（不假设 WORKDIR），`..` 逃逸词法拒绝；skills 安装在 `./.agents/skills/<name>/`，该树对 write/edit/apply_patch 只读。绝对路径直接透传（沙盒是一次性的）。
 - shell 是有状态的：ironhive 每次调用经 cwd/env 事件上报执行后的工作目录与全量环境，turnhive 在下一次前台调用回传（`strict_env`），因此 `cd`/`export` 在 session 内跨调用保持（仅前台完成的调用更新状态）。

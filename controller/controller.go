@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,17 @@ const lookupTimeout = 5 * time.Second
 // allocateTimeout bounds sandbox allocation; ironhive may block up to 30s
 // server-side waiting for a standby pod.
 const allocateTimeout = 40 * time.Second
+
+// newSessionID generates a session id: sess-<lowercase ULID>, the same
+// scheme as ironhive's sandbox names.
+func newSessionID() string {
+	return "sess-" + strings.ToLower(ulid.Make().String())
+}
+
+// newTurnID generates a turn id, following the session id scheme.
+func newTurnID() string {
+	return "turn-" + strings.ToLower(ulid.Make().String())
+}
 
 // turnTimeout bounds a single agent turn.
 const turnTimeout = time.Hour
@@ -72,6 +85,7 @@ func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", c.handleHealthz)
 	mux.HandleFunc("POST /v1/sessions", c.handleCreateSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", c.handleCreateMessage)
+	mux.HandleFunc("GET /v1/sessions/{id}/events", c.handleSessionEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/tool_results", c.handleCreateToolResult)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", c.handleDeleteSession)
 }
@@ -119,9 +133,9 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	id := "sess-" + strings.ToLower(ulid.Make().String())
+	id := newSessionID()
 
-	sess := &Session{ID: id, Spec: req, Sandbox: sandbox}
+	sess := &Session{ID: id, Spec: req, Sandbox: sandbox, hub: newEventHub()}
 	externalTools := make([]agent.ExternalToolSpec, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		externalTools = append(externalTools, agent.ExternalToolSpec{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
@@ -186,8 +200,11 @@ type CreateMessageRequest struct {
 	Content string `json:"content"`
 }
 
-// handleCreateMessage runs one agent turn and streams it back as SSE.
-// Events: delta, reasoning_delta, tool_call, done, error.
+// handleCreateMessage accepts one user input and runs its turn
+// asynchronously: the response is the new turn id, and all turn events
+// flow over the session event stream (GET .../events). A session runs
+// one turn at a time; a concurrent message is rejected with 409
+// session_busy.
 func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !c.routeSession(w, r, id) {
@@ -212,19 +229,100 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 	}
 	sess := v.(*Session)
 
-	rep := newSSEReporter(w)
-	ctx, cancel := context.WithTimeout(r.Context(), turnTimeout)
-	defer cancel()
-	err := sess.Loop.RunTurn(ctx, req.Content, rep)
-	rep.Close()
-	if errors.Is(err, agent.ErrBusy) {
-		// No SSE bytes were written yet, so a plain JSON error is still
-		// possible.
+	// The turn runs detached from this request: a client disconnect does
+	// not abort it (DELETE session or node shutdown does).
+	turnID := newTurnID()
+	ctx, cancel := context.WithTimeout(context.Background(), turnTimeout)
+	if !sess.startTurn(turnID, cancel) {
+		cancel()
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "session_busy"})
 		return
 	}
-	if err != nil {
-		log.Printf("session %s turn: %v", id, err)
+	sess.hub.publish(turnID, "turn_started", map[string]string{"turn_id": turnID})
+	go func() {
+		defer sess.finishTurn()
+		defer cancel()
+		rep := &hubReporter{hub: sess.hub, turnID: turnID}
+		if err := sess.Loop.RunTurn(ctx, req.Content, rep); err != nil {
+			if errors.Is(err, agent.ErrBusy) {
+				// Unreachable given startTurn; publish so subscribers are
+				// not stuck watching an open turn.
+				rep.Error("session busy")
+			}
+			log.Printf("session %s turn %s: %v", id, turnID, err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]string{"turn_id": turnID})
+}
+
+// handleSessionEvents streams the session's events as SSE. On connect
+// the client receives a sync control event (current turn + latest seq),
+// then the buffered backlog after last_seq (query parameter or
+// Last-Event-ID header), then live events. Slow subscribers are dropped
+// and expected to reconnect with their last seq.
+func (c *Controller) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		// Lost a race with DELETE after routeSession.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := v.(*Session)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
+		return
+	}
+	lastSeq, _ := strconv.ParseInt(r.URL.Query().Get("last_seq"), 10, 64)
+	if lastSeq == 0 {
+		lastSeq, _ = strconv.ParseInt(r.Header.Get("Last-Event-ID"), 10, 64)
+	}
+
+	ch, backlog, currentTurn, latest := sess.hub.subscribe(lastSeq)
+	defer sess.hub.unsubscribe(ch)
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	// The sync frame carries the full merged history (completed turns as
+	// {user, assistant} pairs) so a fresh client synchronizes in one
+	// frame; the backlog then only matters for in-flight progress.
+	history := sess.Loop.Messages()
+	messages := make([]syncMessage, 0, len(history))
+	for _, m := range history {
+		messages = append(messages, syncMessage{Role: m.Role, Content: m.Content})
+	}
+	writeSSESync(w, currentTurn, latest, messages)
+	for _, ev := range backlog {
+		writeSSEFrame(w, ev)
+	}
+	flusher.Flush()
+
+	keepalive := time.NewTicker(sseKeepalive)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				// Dropped for lagging behind; the client reconnects.
+				return
+			}
+			writeSSEFrame(w, ev)
+			flusher.Flush()
+		case <-keepalive.C:
+			_, _ = io.WriteString(w, sseKeepaliveComment)
+			flusher.Flush()
+		}
 	}
 }
 
@@ -267,6 +365,7 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	v, _ := c.sessions.Load(id)
 	c.sessions.Delete(id)
 	if sess, ok := v.(*Session); ok {
+		sess.cancelTurn()
 		if sess.stopRenew != nil {
 			sess.stopRenew()
 		}
@@ -290,6 +389,7 @@ func (c *Controller) Close() {
 	c.sessions.Range(func(key, v any) bool {
 		c.sessions.Delete(key)
 		if sess, ok := v.(*Session); ok {
+			sess.cancelTurn()
 			if sess.stopRenew != nil {
 				sess.stopRenew()
 			}

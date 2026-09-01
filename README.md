@@ -12,12 +12,13 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 
 ## 对外 API
 
-客户端只需要四个接口：
+客户端只需要五个接口：
 
 | 接口 | 说明 |
 | --- | --- |
 | `POST /v1/sessions` | 创建 session，返回 session ID |
-| `POST /v1/sessions/{id}/messages` | 向 session 发送输入，流式（SSE）返回 Agent 输出 |
+| `POST /v1/sessions/{id}/messages` | 向 session 发送输入，异步受理，返回 turn ID |
+| `GET /v1/sessions/{id}/events` | session 事件流（SSE）：所有 turn 的输出都经此通道下发 |
 | `POST /v1/sessions/{id}/tool_results` | 回报外部工具的执行结果 |
 | `DELETE /v1/sessions/{id}` | 销毁 session，释放其占用的集群资源 |
 
@@ -49,19 +50,25 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 }
 ```
 
-### 与 session 交互（SSE）
+### 发送消息（异步受理）
 
-`POST /v1/sessions/{id}/messages`，body `{"content": "..."}`，响应为 `text/event-stream`，事件：
+`POST /v1/sessions/{id}/messages`，body `{"content": "..."}`。turn 在集群内部异步执行，响应为 `202 {"turn_id": "turn-..."}`；turn 的全部输出经事件流（见下）下发。客户端断开此请求不会中断 turn。
+
+session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error":"session_busy"}`。
+
+### session 事件流（SSE）
+
+`GET /v1/sessions/{id}/events`，响应为 `text/event-stream`。连接建立后先收到一个 `sync` 控制事件（当前进行中的 turn 与最新序号），随后是缓冲的历史事件与实时事件。每个事件带 `id: <seq>`（SSE 标准字段，按 session 单调递增）；断线后带 `?last_seq=<N>`（或 `Last-Event-ID` 头）重连即可从断点重放（服务端保留最近 2000 条事件）。
 
 | 事件 | 数据 | 说明 |
 | --- | --- | --- |
-| `delta` | `{"text"}` | 模型输出增量 |
-| `reasoning_delta` | `{"text"}` | 推理内容增量 |
-| `tool_call` | `{"id","name","status"}` | 工具调用开始（`running`）/结束（`done`/`error`） |
-| `done` | `{"text"}` | 本轮完成，text 为完整回复 |
-| `error` | `{"message"}` | 本轮失败 |
-
-session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error":"session_busy"}`。
+| `sync` | `{"turn_id","seq","messages"}` | 连接后的首帧：当前 turn（空闲为 ""）、最新序号，以及合并后的全部历史消息（{user, assistant} 对）——客户端凭此一帧完成同步 |
+| `turn_started` | `{"turn_id"}` | 一个 turn 开始 |
+| `delta` | `{"turn_id","text"}` | 模型输出增量 |
+| `reasoning_delta` | `{"turn_id","text"}` | 推理内容增量 |
+| `tool_call` | `{"turn_id","id","name","status"}` | 工具调用开始（`running`）/结束（`done`/`error`） |
+| `done` | `{"turn_id","text"}` | 本轮完成，text 为完整回复 |
+| `error` | `{"turn_id","message"}` | 本轮失败 |
 
 ### 外部工具回报
 
@@ -91,12 +98,15 @@ cli := turnhive.NewClient("http://turnhive:8080")
 sess, _ := cli.CreateSession(ctx, turnhive.CreateSessionRequest{ /* ... */ })
 defer cli.DeleteSession(ctx, sess.ID)
 
-stream, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
+turnID, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
+
+stream, _ := cli.Events(ctx, sess.ID, 0) // 断线后用最后看到的 event.Seq 重连重放
 for event := range stream.Events() {
-    // event.Type: delta / reasoning_delta / tool_call / done / error
+    // event.Type: sync / turn_started / delta / reasoning_delta / tool_call / done / error
     // 外部工具调用（event.Type == tool_call 且 status 为 running）执行后：
     //   cli.ReportToolResult(ctx, sess.ID, event.ID, result)
     //   或 cli.ReportToolError(ctx, sess.ID, event.ID, err)
+    _ = turnID
 }
 ```
 
