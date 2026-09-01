@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/config"
 	"github.com/yankeguo/turnhive/controller"
 	"github.com/yankeguo/turnhive/registry"
@@ -45,7 +46,8 @@ func main() {
 	log.Printf("node registered in etcd with lease TTL %s", time.Duration(cfg.Etcd.LeaseTTL))
 
 	mux := http.NewServeMux()
-	controller.New(cfg.Node.ID, reg).RegisterRoutes(mux)
+	ihClient := ironhive.NewClient(cfg.Ironhive.URL)
+	controller.New(cfg.Node.ID, reg, ihClient, time.Duration(cfg.Ironhive.Lease)).RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,

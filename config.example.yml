@@ -52,3 +52,11 @@ etcd:
   # A node that crashes or loses its keepalive disappears from the
   # cluster (together with its sessions) after this duration.
   lease_ttl: 10s
+
+ironhive:
+  # Base URL of the ironhive controller, which provides the sandboxes
+  # sessions execute in. Required.
+  url: "http://127.0.0.1:8080"
+  # Sandbox lease duration requested at allocation time. A sandbox whose
+  # lease expires is destroyed by ironhive. Default 30m.
+  lease: 30m

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/yankeguo/ironhive"
 )
 
 // ProtocolOpenAICompletions is the only model protocol currently
@@ -17,6 +19,8 @@ const ProtocolOpenAICompletions = "openai_completions"
 type Session struct {
 	ID   string
 	Spec CreateSessionRequest
+	// Sandbox is the ironhive sandbox allocated for this session.
+	Sandbox *ironhive.Sandbox
 
 	mu sync.Mutex
 	// toolResults queues externally reported tool results until the
@@ -36,6 +40,7 @@ func (s *Session) AddToolResult(r ToolResultRequest) {
 type CreateSessionRequest struct {
 	Model      ModelSpec       `json:"model"`
 	Prompt     PromptSpec      `json:"prompt"`
+	Ironhive   IronhiveSpec    `json:"ironhive"`
 	Skills     []SkillSpec     `json:"skills"`
 	MCPServers []MCPServerSpec `json:"mcp_servers"`
 	Tools      []ToolSpec      `json:"tools"`
@@ -59,6 +64,12 @@ type ModelSpec struct {
 type PromptSpec struct {
 	// System is the system prompt in plain text.
 	System string `json:"system"`
+}
+
+// IronhiveSpec selects the sandbox the session executes in.
+type IronhiveSpec struct {
+	// Pool is the ironhive pool a sandbox is allocated from.
+	Pool string `json:"pool"`
 }
 
 // SkillSpec references a skill tarball stored in S3.
@@ -133,6 +144,9 @@ func (r *CreateSessionRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.Prompt.System) == "" {
 		return fmt.Errorf("prompt.system is required")
+	}
+	if strings.TrimSpace(r.Ironhive.Pool) == "" {
+		return fmt.Errorf("ironhive.pool is required")
 	}
 	for i, s := range r.Skills {
 		if strings.TrimSpace(s.Name) == "" {

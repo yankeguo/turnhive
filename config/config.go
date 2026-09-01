@@ -24,6 +24,10 @@ const DefaultEtcdDialTimeout = 5 * time.Second
 // itself and its sessions under.
 const DefaultEtcdLeaseTTL = 10 * time.Second
 
+// DefaultIronhiveLease is the default sandbox lease duration requested
+// when allocating a session sandbox.
+const DefaultIronhiveLease = 30 * time.Minute
+
 // DefaultListen is the default address the HTTP server listens on.
 const DefaultListen = ":8080"
 
@@ -48,6 +52,20 @@ type Config struct {
 	Node   NodeConfig `yaml:"node"`
 	S3     S3Config   `yaml:"s3"`
 	Etcd   EtcdConfig `yaml:"etcd"`
+	// Ironhive holds the sandbox service connection settings.
+	Ironhive IronhiveConfig `yaml:"ironhive"`
+}
+
+// IronhiveConfig holds the settings for reaching an ironhive controller,
+// which provides the sandboxes sessions execute in.
+type IronhiveConfig struct {
+	// URL is the base URL of the ironhive controller, e.g.
+	// "http://ironhive-controller:8080". Required.
+	URL string `yaml:"url"`
+	// Lease is the sandbox lease duration requested at allocation time.
+	// A sandbox whose lease expires is destroyed by ironhive. Defaults
+	// to 30m.
+	Lease Duration `yaml:"lease"`
 }
 
 // NodeConfig holds the identity of this cluster node, used for service
@@ -177,6 +195,9 @@ func (c *Config) setDefaults() {
 	if c.Etcd.LeaseTTL == 0 {
 		c.Etcd.LeaseTTL = Duration(DefaultEtcdLeaseTTL)
 	}
+	if c.Ironhive.Lease == 0 {
+		c.Ironhive.Lease = Duration(DefaultIronhiveLease)
+	}
 }
 
 func (c *Config) validate() error {
@@ -206,6 +227,16 @@ func (c *Config) validate() error {
 	}
 	if (c.Etcd.TLS.CertFile == "") != (c.Etcd.TLS.KeyFile == "") {
 		return fmt.Errorf("etcd.tls.cert_file and etcd.tls.key_file must be set together")
+	}
+	if c.Ironhive.URL == "" {
+		return fmt.Errorf("ironhive.url is required")
+	}
+	if u, err := url.Parse(c.Ironhive.URL); err != nil ||
+		(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("ironhive.url must be an http(s):// URL")
+	}
+	if c.Ironhive.Lease <= 0 {
+		return fmt.Errorf("ironhive.lease must be positive")
 	}
 	return nil
 }

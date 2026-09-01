@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/registry"
 )
 
@@ -23,10 +24,18 @@ const headerForwarded = "X-Turnhive-Forwarded"
 // lookupTimeout bounds etcd ownership lookups on the request path.
 const lookupTimeout = 5 * time.Second
 
+// allocateTimeout bounds sandbox allocation; ironhive may block up to 30s
+// server-side waiting for a standby pod.
+const allocateTimeout = 40 * time.Second
+
 // Controller holds the dependencies shared by all HTTP handlers.
 type Controller struct {
 	nodeID   string
 	registry *registry.Registry
+	ironhive *ironhive.Client
+	// sandboxLease is the lease duration requested when allocating a
+	// session sandbox.
+	sandboxLease time.Duration
 
 	// sessions holds the sessions owned by this node, keyed by session ID.
 	sessions sync.Map
@@ -35,8 +44,8 @@ type Controller struct {
 }
 
 // New creates a Controller for the given node.
-func New(nodeID string, reg *registry.Registry) *Controller {
-	return &Controller{nodeID: nodeID, registry: reg}
+func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, sandboxLease time.Duration) *Controller {
+	return &Controller{nodeID: nodeID, registry: reg, ironhive: ih, sandboxLease: sandboxLease}
 }
 
 // RegisterRoutes registers all routes on the given mux using the Go 1.22+
@@ -68,6 +77,17 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Allocate the sandbox before registering anything, so a failed
+	// allocation leaves no state behind.
+	allocCtx, allocCancel := context.WithTimeout(r.Context(), allocateTimeout)
+	sandbox, err := c.ironhive.Allocate(allocCtx, req.Ironhive.Pool, c.sandboxLease)
+	allocCancel()
+	if err != nil {
+		log.Printf("allocate sandbox from pool %q: %v", req.Ironhive.Pool, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to allocate sandbox"})
+		return
+	}
+
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	id := hex.EncodeToString(b[:])
@@ -76,10 +96,11 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	defer cancel()
 	if err := c.registry.RegisterSession(ctx, id); err != nil {
 		log.Printf("register session %s: %v", id, err)
+		releaseSandbox(sandbox)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
 		return
 	}
-	c.sessions.Store(id, &Session{ID: id, Spec: req})
+	c.sessions.Store(id, &Session{ID: id, Spec: req, Sandbox: sandbox})
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
@@ -123,13 +144,28 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	if !c.routeSession(w, r, id) {
 		return
 	}
+	v, _ := c.sessions.Load(id)
 	c.sessions.Delete(id)
+	if sess, ok := v.(*Session); ok && sess.Sandbox != nil {
+		releaseSandbox(sess.Sandbox)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
 	defer cancel()
 	if err := c.registry.UnregisterSession(ctx, id); err != nil {
 		log.Printf("unregister session %s: %v", id, err)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// releaseSandbox destroys a session's sandbox on a detached context, so
+// cleanup survives client disconnects. Failures are only logged: the
+// sandbox lease guarantees eventual reclamation by ironhive.
+func releaseSandbox(sb *ironhive.Sandbox) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	if err := sb.Release(ctx); err != nil {
+		log.Printf("release sandbox %s: %v", sb.Name, err)
+	}
 }
 
 // routeSession ensures the request is handled on the node that owns the
