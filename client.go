@@ -171,11 +171,17 @@ type SkillSpec struct {
 	ObjectKey string `json:"object_key"`
 }
 
-// MCPServerSpec describes an MCP server the session may use.
+// MCPServerSpec describes an MCP server the session may use. Only
+// HTTP-based transports are supported (no stdio).
 type MCPServerSpec struct {
+	// Name namespaces the server's tools as "{name}__{tool}".
 	Name    string            `json:"name"`
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// Transport selects the wire transport: "streamable" or "sse".
+	// Empty means auto: try streamable HTTP first, fall back to legacy
+	// SSE when the connect fails.
+	Transport string `json:"transport,omitempty"`
 }
 
 // ToolSpec describes an external tool the session may call. Tool calls

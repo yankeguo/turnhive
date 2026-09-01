@@ -757,3 +757,97 @@ func TestLoopToolErrorTruncated(t *testing.T) {
 		t.Fatalf("expected truncation notice, got (tail) %q", toolMsg.Content[len(toolMsg.Content)-300:])
 	}
 }
+
+// fakeMCPTool records executions and returns a fixed output.
+type fakeMCPTool struct {
+	name   string
+	output string
+	calls  [][]byte
+}
+
+func (t *fakeMCPTool) Spec() llm.ToolDef {
+	return llm.ToolDef{Name: t.name, Parameters: map[string]any{"type": "object"}}
+}
+
+func (t *fakeMCPTool) Execute(_ context.Context, _ string, args json.RawMessage) (string, error) {
+	t.calls = append(t.calls, append([]byte(nil), args...))
+	return t.output, nil
+}
+
+func TestLoopMCPToolsMountedPerTurn(t *testing.T) {
+	fs := &fakeStream{}
+	fs.toolCallReply(llm.ToolCall{ID: "c1", Name: "mcp__ping", Arguments: json.RawMessage(`{"x":1}`)})
+	fs.textReply("pong done")
+
+	mcpTool := &fakeMCPTool{name: "mcp__ping", output: "pong"}
+	closed := false
+	l := newTestLoop(LoopConfig{
+		ModelName:  "test-model",
+		MCPServers: []MCPServerSpec{{Name: "mcp", URL: "http://127.0.0.1:1"}},
+	}, fs)
+	// Replace the wired connector with a stub serving the fake tool.
+	l.mcpConnect = func(context.Context) ([]Tool, func()) {
+		return []Tool{mcpTool}, func() { closed = true }
+	}
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "ping", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if !closed {
+		t.Fatal("MCP connections must be closed when the turn ends")
+	}
+	if len(mcpTool.calls) != 1 || string(mcpTool.calls[0]) != `{"x":1}` {
+		t.Fatalf("MCP tool not dispatched with its arguments: %+v", mcpTool.calls)
+	}
+	// The first request of the turn already carries the MCP tool def.
+	found := false
+	for _, d := range fs.requests[0].Tools {
+		if d.Name == "mcp__ping" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("MCP tool def missing from the first request: %+v", fs.requests[0].Tools)
+	}
+	// The tool result was fed back as a tool message.
+	req := fs.lastRequest()
+	var toolMsg *llm.Message
+	for i := range req.Messages {
+		if req.Messages[i].Role == "tool" {
+			toolMsg = &req.Messages[i]
+		}
+	}
+	if toolMsg == nil || toolMsg.Content != "pong" {
+		t.Fatalf("expected MCP tool result fed back, got %+v", req.Messages)
+	}
+}
+
+func TestLoopMCPToolNameCollisionSkipped(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("ok")
+
+	shadow := &fakeMCPTool{name: "deploy", output: "shadow"}
+	l := newTestLoop(LoopConfig{
+		ModelName:     "test-model",
+		MCPServers:    []MCPServerSpec{{Name: "mcp", URL: "http://127.0.0.1:1"}},
+		ExternalTools: []ExternalToolSpec{{Name: "deploy", Parameters: map[string]any{}}},
+	}, fs)
+	l.mcpConnect = func(context.Context) ([]Tool, func()) {
+		return []Tool{shadow}, func() {}
+	}
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "hi", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	count := 0
+	for _, d := range fs.lastRequest().Tools {
+		if d.Name == "deploy" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("colliding MCP tool must not duplicate an existing def: %+v", fs.lastRequest().Tools)
+	}
+}

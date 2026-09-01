@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -297,6 +298,12 @@ var modelFeatures = map[string]bool{
 	ModelFeatureSupportImage: true,
 }
 
+// mcpServerNamePattern bounds an MCP server name: it prefixes every tool
+// of the server as "{name}__{tool}", and the result must satisfy the
+// upstream function-name constraint (64 chars max), so the name itself
+// is capped at 32.
+var mcpServerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
+
 // PromptSpec holds the session's prompt materials.
 type PromptSpec struct {
 	// System is the system prompt in plain text.
@@ -317,11 +324,18 @@ type SkillSpec struct {
 	ObjectKey string `json:"object_key"`
 }
 
-// MCPServerSpec describes an MCP server the session may use.
+// MCPServerSpec describes an MCP server the session may use. Only
+// HTTP-based transports are supported (no stdio).
 type MCPServerSpec struct {
+	// Name namespaces the server's tools as "{name}__{tool}"; it must
+	// match ^[a-zA-Z0-9_-]{1,32}$ and be unique within mcp_servers.
 	Name    string            `json:"name"`
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
+	// Transport selects the wire transport: "streamable" or "sse".
+	// Empty means auto: try streamable HTTP first, fall back to legacy
+	// SSE when the connect fails.
+	Transport string `json:"transport"`
 }
 
 // ToolSpec describes an external tool the session may call. Tool calls
@@ -401,15 +415,25 @@ func (r *CreateSessionRequest) Validate() error {
 			return fmt.Errorf("skills[%d].object_key is required", i)
 		}
 	}
+	seenMCP := make(map[string]bool, len(r.MCPServers))
 	for i, m := range r.MCPServers {
-		if strings.TrimSpace(m.Name) == "" {
-			return fmt.Errorf("mcp_servers[%d].name is required", i)
+		if !mcpServerNamePattern.MatchString(m.Name) {
+			return fmt.Errorf("mcp_servers[%d].name must match %s (tool namespacing and the upstream function-name limit)", i, mcpServerNamePattern)
 		}
+		if seenMCP[m.Name] {
+			return fmt.Errorf("mcp_servers[%d].name %q duplicates an earlier server", i, m.Name)
+		}
+		seenMCP[m.Name] = true
 		if m.URL == "" {
 			return fmt.Errorf("mcp_servers[%d].url is required", i)
 		}
 		if err := validateHTTPURL(fmt.Sprintf("mcp_servers[%d].url", i), m.URL); err != nil {
 			return err
+		}
+		switch m.Transport {
+		case "", agent.MCPTransportStreamable, agent.MCPTransportSSE:
+		default:
+			return fmt.Errorf("mcp_servers[%d].transport must be %q or %q (empty for auto)", i, agent.MCPTransportStreamable, agent.MCPTransportSSE)
 		}
 	}
 	for i, t := range r.Tools {

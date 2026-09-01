@@ -221,6 +221,10 @@ func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.
 	for _, t := range req.Tools {
 		externalTools = append(externalTools, agent.ExternalToolSpec{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
 	}
+	mcpServers := make([]agent.MCPServerSpec, 0, len(req.MCPServers))
+	for _, m := range req.MCPServers {
+		mcpServers = append(mcpServers, agent.MCPServerSpec{Name: m.Name, URL: m.URL, Headers: m.Headers, Transport: m.Transport})
+	}
 	return agent.NewLoop(agent.LoopConfig{
 		ModelURL:      req.Model.URL,
 		ModelHeaders:  req.Model.Headers,
@@ -235,6 +239,14 @@ func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.
 		Waiter:        sess,
 		History:       agent.S3History(c.store, sess.ID),
 		MaxContext:    req.Model.MaxContext,
+		MCPServers:    mcpServers,
+		OnMCPStatus: func(st agent.MCPServerStatus) {
+			if st.Err != nil {
+				log.Printf("session %s mcp %s: %v", sess.ID, st.Name, st.Err)
+			} else {
+				log.Printf("session %s mcp %s: %d tools mounted", sess.ID, st.Name, st.ToolCount)
+			}
+		},
 	})
 }
 

@@ -56,6 +56,14 @@ type LoopConfig struct {
 	// History persists the message history; nil keeps history in memory
 	// only.
 	History HistoryStore
+	// MCPServers are connected at the start of every turn; their tools
+	// are mounted namespaced as "{name}__{tool}" and live only for that
+	// turn. A server that fails to connect is skipped — the turn
+	// proceeds without its tools.
+	MCPServers []MCPServerSpec
+	// OnMCPStatus is called once per configured MCP server at the start
+	// of every turn with the connection result; nil disables reporting.
+	OnMCPStatus func(MCPServerStatus)
 	// MaxContext is the model's context window in tokens; zero disables
 	// context window management. When set, the history is trimmed before
 	// every turn (TruncateToFit) and compacted after a turn whose usage
@@ -67,15 +75,16 @@ type LoopConfig struct {
 // completions, dispatches tool calls to sandbox and external tools, and
 // persists the {user, assistant} history between turns.
 type Loop struct {
-	cfg       LoopConfig
-	stream    func(ctx context.Context, req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error)
-	tools     []Tool
-	toolDefs  []llm.ToolDef
-	spiller   OutputSpiller
-	busy      atomic.Bool
-	mu        sync.Mutex
-	history   []llm.Message
-	histReady bool
+	cfg        LoopConfig
+	stream     func(ctx context.Context, req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error)
+	tools      []Tool
+	toolDefs   []llm.ToolDef
+	spiller    OutputSpiller
+	mcpConnect func(ctx context.Context) ([]Tool, func())
+	busy       atomic.Bool
+	mu         sync.Mutex
+	history    []llm.Message
+	histReady  bool
 }
 
 // NewLoop creates a Loop. Sandbox tools come first, then external tools.
@@ -91,6 +100,11 @@ func NewLoop(cfg LoopConfig) *Loop {
 	}
 	l.tools = append(l.tools, ExternalTools(cfg.ExternalTools, cfg.Waiter, cfg.ExternalToolTimeout)...)
 	l.toolDefs = toolSpecs(l.tools)
+	if len(cfg.MCPServers) > 0 {
+		l.mcpConnect = func(ctx context.Context) ([]Tool, func()) {
+			return ConnectMCPServers(ctx, cfg.MCPServers, cfg.OnMCPStatus)
+		}
+	}
 	return l
 }
 
@@ -117,6 +131,35 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 	}
 
 	userMsg := llm.Message{Role: "user", Content: userText}
+
+	// Per-turn MCP connections (aligned with the runner): tools of the
+	// configured servers are mounted for this turn only, and every
+	// connection is released when the turn ends — no session lifecycle
+	// path has to maintain them.
+	tools, toolDefs := l.tools, l.toolDefs
+	if l.mcpConnect != nil {
+		mcpTools, closeMCP := l.mcpConnect(ctx)
+		defer closeMCP()
+		if len(mcpTools) > 0 {
+			tools = make([]Tool, 0, len(l.tools)+len(mcpTools))
+			tools = append(tools, l.tools...)
+			for _, t := range mcpTools {
+				// A name colliding with a built-in or external tool
+				// would shadow it in dispatch order; skip instead.
+				exists := false
+				for _, d := range l.toolDefs {
+					if d.Name == t.Spec().Name {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					tools = append(tools, t)
+				}
+			}
+			toolDefs = toolSpecs(tools)
+		}
+	}
 
 	// Pre-turn context window management: drop the oldest whole turns
 	// when the estimated history no longer fits the window (the incoming
@@ -153,7 +196,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 			Headers:  l.cfg.ModelHeaders,
 			Model:    l.cfg.ModelName,
 			Messages: working,
-			Tools:    l.toolDefs,
+			Tools:    toolDefs,
 		}, func(ev llm.Event) {
 			switch ev.Type {
 			case llm.EventDelta:
@@ -190,7 +233,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		working = append(working, msg)
 		for _, tc := range msg.ToolCalls {
 			r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallRunning})
-			out, images, err := dispatchTool(ctx, l.tools, l.spiller, tc.ID, tc.Name, tc.Arguments)
+			out, images, err := dispatchTool(ctx, tools, l.spiller, tc.ID, tc.Name, tc.Arguments)
 			var resultText string
 			if err != nil {
 				r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallError})

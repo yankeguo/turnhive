@@ -57,6 +57,44 @@ func TestCreateSessionRequestValidateModelParams(t *testing.T) {
 	}
 }
 
+func TestCreateSessionRequestValidateMCPServers(t *testing.T) {
+	// A full valid entry passes, transport empty (auto) or explicit.
+	req := validSessionRequest()
+	req.MCPServers = []MCPServerSpec{
+		{Name: "fs-1", URL: "http://mcp.example.com/sse"},
+		{Name: "wiki", URL: "https://mcp.example.com/mcp", Transport: "streamable", Headers: map[string]string{"Authorization": "Bearer x"}},
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("valid mcp_servers rejected: %v", err)
+	}
+
+	// Names violating the namespacing pattern are rejected.
+	for _, name := range []string{"", "has space", "dot.name", strings.Repeat("a", 33)} {
+		req = validSessionRequest()
+		req.MCPServers = []MCPServerSpec{{Name: name, URL: "http://mcp.example.com"}}
+		if err := req.Validate(); err == nil || !strings.Contains(err.Error(), "mcp_servers[0].name") {
+			t.Fatalf("expected name error for %q, got %v", name, err)
+		}
+	}
+
+	// Duplicate names are rejected.
+	req = validSessionRequest()
+	req.MCPServers = []MCPServerSpec{
+		{Name: "fs", URL: "http://a.example.com"},
+		{Name: "fs", URL: "http://b.example.com"},
+	}
+	if err := req.Validate(); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("expected duplicate name error, got %v", err)
+	}
+
+	// Unknown transports are rejected.
+	req = validSessionRequest()
+	req.MCPServers = []MCPServerSpec{{Name: "fs", URL: "http://mcp.example.com", Transport: "stdio"}}
+	if err := req.Validate(); err == nil || !strings.Contains(err.Error(), "transport") {
+		t.Fatalf("expected transport error, got %v", err)
+	}
+}
+
 func TestSessionRecordPersisted(t *testing.T) {
 	sess := &Session{}
 	sess.recordPersisted(agent.PersistedObject{Path: "b.txt", ObjectKey: "sessions/s/persisted/b.txt", Size: 1})

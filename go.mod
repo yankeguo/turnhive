@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.110.0
 	github.com/aws/smithy-go v1.28.1
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/yankeguo/ironhive v0.0.0-20260831044318-0ef40d03b0dd
 	go.etcd.io/etcd/client/pkg/v3 v3.7.1
@@ -32,13 +33,20 @@ require (
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
+	github.com/segmentio/asm v1.1.3 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.etcd.io/etcd/api/v3 v3.7.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	google.golang.org/grpc v1.82.1 // indirect
