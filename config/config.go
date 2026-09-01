@@ -12,9 +12,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultEtcdPrefix is the default etcd key prefix for node and session
-// records.
-const DefaultEtcdPrefix = "turnhive"
+// DefaultPrefix is the default object key prefix used when storing objects
+// in a shared S3 bucket.
+const DefaultPrefix = "turnhive"
 
 // DefaultEtcdDialTimeout is the default timeout for establishing a
 // connection to an etcd endpoint.
@@ -83,6 +83,9 @@ type S3Config struct {
 	// instead of virtual-hosted style. Required by MinIO and many
 	// on-premise S3-compatible services.
 	ForcePathStyle bool `yaml:"force_path_style"`
+	// Prefix is prepended to every object key so multiple projects can
+	// share one bucket. Defaults to "turnhive".
+	Prefix string `yaml:"prefix"`
 }
 
 // Secure reports whether HTTPS should be used; it defaults to true.
@@ -162,11 +165,14 @@ func (c *Config) setDefaults() {
 		}
 		c.Node.Advertise = "http://127.0.0.1:" + port
 	}
+	if c.S3.Prefix == "" {
+		c.S3.Prefix = DefaultPrefix
+	}
 	if c.Etcd.DialTimeout == 0 {
 		c.Etcd.DialTimeout = Duration(DefaultEtcdDialTimeout)
 	}
 	if c.Etcd.Prefix == "" {
-		c.Etcd.Prefix = DefaultEtcdPrefix
+		c.Etcd.Prefix = DefaultPrefix
 	}
 	if c.Etcd.LeaseTTL == 0 {
 		c.Etcd.LeaseTTL = Duration(DefaultEtcdLeaseTTL)
@@ -183,6 +189,10 @@ func (c *Config) validate() error {
 	}
 	if c.S3.Bucket == "" {
 		return fmt.Errorf("s3.bucket is required")
+	}
+	c.S3.Prefix = strings.Trim(c.S3.Prefix, "/")
+	if strings.Contains(c.S3.Prefix, "//") {
+		return fmt.Errorf("s3.prefix must not contain consecutive slashes")
 	}
 	if len(c.Etcd.Endpoints) == 0 {
 		return fmt.Errorf("etcd.endpoints is required")

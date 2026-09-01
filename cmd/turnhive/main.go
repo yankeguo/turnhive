@@ -26,8 +26,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	log.Printf("config loaded: node id=%q advertise=%q, s3 bucket=%q, etcd endpoints=%v",
-		cfg.Node.ID, cfg.Node.Advertise, cfg.S3.Bucket, cfg.Etcd.Endpoints)
+	log.Printf("config loaded: node id=%q advertise=%q, s3 bucket=%q prefix=%q, etcd endpoints=%v",
+		cfg.Node.ID, cfg.Node.Advertise, cfg.S3.Bucket, cfg.S3.Prefix, cfg.Etcd.Endpoints)
 
 	etcdClient, err := newEtcdClient(cfg)
 	if err != nil {
