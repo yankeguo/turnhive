@@ -3,32 +3,55 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
-// fakePersistStore records PutObject calls and serves GetObject from
-// them.
+// fakePersistStore records PutObject calls and serves PresignGet
+// downloads from its own httptest server (the sandbox fetches objects
+// from there, like a real S3 presigned URL).
 type fakePersistStore struct {
 	objects map[string][]byte
+	srv     *httptest.Server
 }
 
-func (f *fakePersistStore) PutObject(_ context.Context, key string, body []byte) error {
-	if f.objects == nil {
-		f.objects = map[string][]byte{}
-	}
-	f.objects[key] = body
-	return nil
+func newFakePersistStore(t *testing.T) *fakePersistStore {
+	t.Helper()
+	f := &fakePersistStore{objects: map[string][]byte{}}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		switch r.Method {
+		case http.MethodPut: // presigned upload
+			body, _ := io.ReadAll(r.Body)
+			f.objects[key] = body
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet: // presigned download
+			body, ok := f.objects[key]
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write(body)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
 }
 
-func (f *fakePersistStore) GetObject(_ context.Context, key string) ([]byte, error) {
-	body, ok := f.objects[key]
-	if !ok {
-		return nil, errors.New("not found: " + key)
-	}
-	return body, nil
+func (f *fakePersistStore) PresignPut(_ context.Context, key string, _ time.Duration) (string, error) {
+	return f.srv.URL + "/put?key=" + url.QueryEscape(key), nil
+}
+
+func (f *fakePersistStore) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
+	return f.srv.URL + "/get?key=" + url.QueryEscape(key), nil
 }
 
 func TestSandboxPersist(t *testing.T) {
@@ -40,7 +63,7 @@ func TestSandboxPersist(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	store := &fakePersistStore{}
+	store := newFakePersistStore(t)
 	var recorded []PersistedObject
 	tool := sandboxPersist{
 		t:           st,
@@ -79,7 +102,7 @@ func TestLoopPersistRegistered(t *testing.T) {
 	fs.textReply("ok")
 
 	// With a PersistStore the persist tool is advertised...
-	l := newTestLoop(LoopConfig{ModelName: "m", Sandbox: sb, PersistStore: &fakePersistStore{}, SessionID: "sess-x"}, fs)
+	l := newTestLoop(LoopConfig{ModelName: "m", Sandbox: sb, PersistStore: newFakePersistStore(t), SessionID: "sess-x"}, fs)
 	if err := l.RunTurn(context.Background(), "hi", &fakeReporter{}); err != nil {
 		t.Fatalf("RunTurn: %v", err)
 	}
@@ -109,16 +132,15 @@ func TestLoopPersistRegistered(t *testing.T) {
 
 func TestRestorePersisted(t *testing.T) {
 	sb, f := newFakeIronhive(t)
-	store := &fakePersistStore{objects: map[string][]byte{
-		"sessions/sess-x/persisted/report/final.txt": []byte("final results"),
-		"sessions/sess-x/persisted/tmp/cache.json":   []byte(`{"step":3}`),
-	}}
+	store := newFakePersistStore(t)
+	store.objects["sessions/sess-x/persisted/report/final.txt"] = []byte("final results")
+	store.objects["sessions/sess-x/persisted/tmp/cache.json"] = []byte(`{"step":3}`)
 	objects := []PersistedObject{
 		{Path: "report/final.txt", ObjectKey: "sessions/sess-x/persisted/report/final.txt"},
 		{Path: "tmp/cache.json", ObjectKey: "sessions/sess-x/persisted/tmp/cache.json"},
 	}
 
-	if err := RestorePersisted(context.Background(), sb, store, objects); err != nil {
+	if err := RestorePersisted(context.Background(), sb, store, objects, time.Minute); err != nil {
 		t.Fatalf("RestorePersisted: %v", err)
 	}
 	for path, want := range map[string]string{
@@ -132,7 +154,7 @@ func TestRestorePersisted(t *testing.T) {
 	}
 
 	// A missing object aborts the restore.
-	if err := RestorePersisted(context.Background(), sb, store, []PersistedObject{{Path: "x", ObjectKey: "ghost"}}); err == nil {
+	if err := RestorePersisted(context.Background(), sb, store, []PersistedObject{{Path: "x", ObjectKey: "ghost"}}, time.Minute); err == nil {
 		t.Fatal("expected error for missing object")
 	}
 }

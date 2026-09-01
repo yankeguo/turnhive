@@ -145,3 +145,17 @@ func (s *Store) PresignGet(ctx context.Context, key string, ttl time.Duration) (
 	}
 	return req.URL, nil
 }
+
+// PresignPut returns a presigned URL that grants write access to the
+// object stored under key for ttl; upload with HTTP PUT and no extra
+// signed headers (e.g. ironhive's file upload endpoint).
+func (s *Store) PresignPut(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	req, err := s.presign.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.key(key)),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("presign put object %q: %w", key, err)
+	}
+	return req.URL, nil
+}

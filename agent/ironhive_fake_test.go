@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,6 +72,7 @@ func newFakeIronhive(t *testing.T) (*ironhive.Sandbox, *fakeIronhive) {
 		fmt.Fprintf(w, `{"sandbox": "s", "leaseExpires": %s}`, jsonString(time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)))
 	})
 	mux.HandleFunc("/agent/v1/file", f.handleFile)
+	mux.HandleFunc("/agent/v1/file/upload", f.handleFileUpload)
 	mux.HandleFunc("/agent/v1/dir", f.handleDir)
 	mux.HandleFunc("/agent/v1/shell", f.handleShell)
 	mux.HandleFunc("/agent/v1/tar", f.handleTar)
@@ -105,6 +107,19 @@ func (f *fakeIronhive) handleFile(w http.ResponseWriter, r *http.Request) {
 		}
 		http.ServeFile(w, r, local)
 	case http.MethodPut:
+		// Content comes from the request body, or from a URL the sandbox
+		// downloads itself (the presigned-URL injection path).
+		var src io.ReadCloser
+		if u := r.URL.Query().Get("url"); u != "" {
+			resp, err := http.Get(u)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				f.writeError(w, "fetch url failed: "+u, http.StatusBadGateway)
+				return
+			}
+			src = resp.Body
+		} else {
+			src = r.Body
+		}
 		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 			f.writeError(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -115,7 +130,7 @@ func (f *fakeIronhive) handleFile(w http.ResponseWriter, r *http.Request) {
 			f.writeError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if _, err := copyAndClose(out, r); err != nil {
+		if _, err := copyAndClose(out, src); err != nil {
 			f.writeError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -130,10 +145,57 @@ func (f *fakeIronhive) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func copyAndClose(out *os.File, r *http.Request) (int64, error) {
+func copyAndClose(out *os.File, src io.ReadCloser) (int64, error) {
 	defer out.Close()
-	n, err := out.ReadFrom(r.Body)
+	defer src.Close()
+	n, err := out.ReadFrom(src)
 	return n, err
+}
+
+// handleFileUpload serves POST /agent/v1/file/upload: the local file at
+// path is streamed to the form's url with the given method (default
+// POST), mirroring the real agent's upload endpoint.
+func (f *fakeIronhive) handleFileUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		f.writeError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		f.writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	p := r.Form.Get("path")
+	target := r.Form.Get("url")
+	method := r.Form.Get("method")
+	if method == "" {
+		method = http.MethodPost
+	}
+	if p == "" || target == "" {
+		f.writeError(w, "path and url are required", http.StatusBadRequest)
+		return
+	}
+	data, err := os.ReadFile(f.local(p))
+	if err != nil {
+		f.writeError(w, "not found: "+p, http.StatusNotFound)
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, target, strings.NewReader(string(data)))
+	if err != nil {
+		f.writeError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		f.writeError(w, "upload: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		f.writeError(w, "upload: upstream "+resp.Status, http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "OK"}`)
 }
 
 // handleDir serves GET /agent/v1/dir listings.

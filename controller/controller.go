@@ -248,7 +248,7 @@ func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("install skills: %w", err)
 	}
-	if err = agent.RestorePersisted(ctx, sandbox, c.store, sess.Persisted()); err != nil {
+	if err = agent.RestorePersisted(ctx, sandbox, c.store, sess.Persisted(), skillURLTTL); err != nil {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("restore persisted files: %w", err)
 	}
