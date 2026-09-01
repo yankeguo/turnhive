@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -9,7 +10,9 @@ import (
 // Default truncation limits for tool output: when output exceeds the
 // limits, the head is kept as a preview and a truncation notice with a
 // hint is appended, guiding the model to inspect the full content with
-// more targeted calls.
+// more targeted calls. These generous defaults bound the read tool,
+// which truncates itself; every other tool output goes through
+// TruncateSpill with the stricter StrictMaxLines/StrictMaxBytes.
 const (
 	// DefaultMaxLines is the default maximum number of lines kept.
 	DefaultMaxLines = 2000
@@ -18,6 +21,53 @@ const (
 	// DefaultHint is appended to truncated output when no hint is given.
 	DefaultHint = "Output was truncated to fit within context limits. Use grep to search specific content, or read with offset/limit for specific sections."
 )
+
+// Strict truncation limits for non-read tool outputs (shell, external
+// tools). Outputs beyond them are spilled to a sandbox file via
+// TruncateSpill; only a small head preview goes back to the model.
+const (
+	// StrictMaxLines is the maximum number of lines kept inline.
+	StrictMaxLines = 500
+	// StrictMaxBytes is the maximum number of UTF-8 bytes kept inline.
+	StrictMaxBytes = 16 * 1024
+)
+
+// strictHint is appended to strictly truncated output when no spill file
+// is available.
+const strictHint = "Output was truncated to fit within context limits. Use grep via the shell tool to search specific content."
+
+// OutputSpiller persists an oversized tool output where the model can
+// inspect it later (a file inside the sandbox) and returns the path.
+type OutputSpiller interface {
+	// SpillOutput writes content and returns its path.
+	SpillOutput(ctx context.Context, toolName, content string) (path string, err error)
+}
+
+// spillHint points the model at a spilled output file.
+func spillHint(path string) string {
+	return "The full output was saved to: " + path + "\n" +
+		"Inspect it with the read tool, or search and filter it with shell commands (grep, sed, tail)."
+}
+
+// TruncateSpill bounds text to the strict limits for non-read tool
+// outputs. Oversized text is spilled to a sandbox file through spiller
+// and the returned text carries a head preview plus the file path, so no
+// information is lost. Without a spiller — or when spilling fails — it
+// degrades to plain strict truncation.
+func TruncateSpill(ctx context.Context, text, toolName string, spiller OutputSpiller) string {
+	hint := strictHint
+	if overLimits(text, StrictMaxLines, StrictMaxBytes) && spiller != nil {
+		if path, err := spiller.SpillOutput(ctx, toolName, text); err == nil {
+			hint = spillHint(path)
+		}
+	}
+	return Truncate(text, WithMaxLines(StrictMaxLines), WithMaxBytes(StrictMaxBytes), WithHint(hint))
+}
+
+// overLimits reports whether text exceeds either limit.
+func overLimits(text string, maxLines, maxBytes int) bool {
+	return strings.Count(text, "\n")+1 > maxLines || len(text) > maxBytes
+}
 
 // truncateOptions holds the resolved limits of one Truncate call.
 type truncateOptions struct {

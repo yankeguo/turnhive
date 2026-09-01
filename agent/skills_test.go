@@ -18,15 +18,15 @@ func TestBuildSystemPrompt(t *testing.T) {
 	got := BuildSystemPrompt("base prompt", []SkillRef{
 		{Name: "pdf", Description: "Work with PDF files"},
 		{Name: "sql", Description: "Query databases"},
-	}, "/skills")
+	}, ".agents/skills")
 	want := "base prompt\n\n" +
-		"### Skill: pdf\n\nWork with PDF files\n\n(Skill files on disk, read-only: /skills/pdf/)\n\n" +
-		"### Skill: sql\n\nQuery databases\n\n(Skill files on disk, read-only: /skills/sql/)"
+		"### Skill: pdf\n\nWork with PDF files\n\n(Skill files on disk, read-only: .agents/skills/pdf/)\n\n" +
+		"### Skill: sql\n\nQuery databases\n\n(Skill files on disk, read-only: .agents/skills/sql/)"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
-	if got := BuildSystemPrompt("base prompt", nil, "/skills"); got != "base prompt" {
+	if got := BuildSystemPrompt("base prompt", nil, ".agents/skills"); got != "base prompt" {
 		t.Fatalf("expected unchanged prompt, got %q", got)
 	}
 }
@@ -60,7 +60,7 @@ func TestInstallSkills(t *testing.T) {
 		{Name: "pdf", Description: "Work with PDF files", ObjectKey: "skills/pdf.tar"},
 		{Name: "sql", Description: "Query databases", ObjectKey: "skills/sql.tar"},
 	}
-	if err := InstallSkills(context.Background(), sb, store, skills, "/skills", time.Minute); err != nil {
+	if err := InstallSkills(context.Background(), sb, store, skills, ".agents/skills", time.Minute); err != nil {
 		t.Fatalf("InstallSkills: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestInstallSkills(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 tar PUTs, got %d", len(calls))
 	}
-	if calls[0].Path != "/skills/pdf" || calls[1].Path != "/skills/sql" {
+	if calls[0].Path != ".agents/skills/pdf" || calls[1].Path != ".agents/skills/sql" {
 		t.Fatalf("unexpected tar paths %+v", calls)
 	}
 	for i, key := range []string{"turnhive/skills/pdf.tar", "turnhive/skills/sql.tar"} {
@@ -104,7 +104,7 @@ func TestInstallSkillsFailure(t *testing.T) {
 
 	err = InstallSkills(context.Background(), sb, store, []SkillRef{
 		{Name: "pdf", ObjectKey: "skills/pdf.tar"},
-	}, "/skills", time.Minute)
+	}, ".agents/skills", time.Minute)
 	if err == nil || !strings.Contains(err.Error(), `install skill "pdf"`) {
 		t.Fatalf("expected install error, got %v", err)
 	}

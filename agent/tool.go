@@ -18,18 +18,29 @@ type Tool interface {
 	Execute(ctx context.Context, callID string, args json.RawMessage) (string, error)
 }
 
+// selfTruncatingTool marks a Tool that bounds its own output (read);
+// dispatchTool skips the generic spill/truncation for such tools.
+type selfTruncatingTool interface {
+	selfTruncatingOutput()
+}
+
 // dispatchTool finds the tool named name among tools and executes it.
-// Successful output is truncated with Truncate before it goes back to the
-// model; errors are returned untruncated (the caller feeds them back as
-// the tool result text).
-func dispatchTool(ctx context.Context, tools []Tool, callID, name string, args json.RawMessage) (string, error) {
+// Successful output goes through TruncateSpill — oversized output is
+// spilled to a sandbox file and only a strict head preview plus the file
+// path goes back to the model — unless the tool bounds its own output.
+// Errors are returned untruncated (the caller feeds them back as the
+// tool result text).
+func dispatchTool(ctx context.Context, tools []Tool, spiller OutputSpiller, callID, name string, args json.RawMessage) (string, error) {
 	for _, t := range tools {
 		if t.Spec().Name == name {
 			out, err := t.Execute(ctx, callID, args)
 			if err != nil {
 				return "", err
 			}
-			return Truncate(out), nil
+			if _, ok := t.(selfTruncatingTool); ok {
+				return out, nil
+			}
+			return TruncateSpill(ctx, out, name, spiller), nil
 		}
 	}
 	return "", fmt.Errorf("unknown tool: %s", name)
@@ -57,4 +68,9 @@ func jsonSchema(properties map[string]any, required ...string) map[string]any {
 // stringProp is a JSON Schema string property with a description.
 func stringProp(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
+}
+
+// boolProp is a JSON Schema boolean property with a description.
+func boolProp(description string) map[string]any {
+	return map[string]any{"type": "boolean", "description": description}
 }

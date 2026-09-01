@@ -38,12 +38,11 @@ const turnTimeout = time.Hour
 // download skill tarballs.
 const skillURLTTL = 15 * time.Minute
 
-// workspaceRoot and skillsRoot are the sandbox directories sessions
-// operate in; skillsRoot is read-only for the agent.
-const (
-	workspaceRoot = "/workspace"
-	skillsRoot    = "/skills"
-)
+// skillsRoot is the sandbox directory, relative to the sandbox's working
+// directory, where skill tarballs are installed; it is read-only for the
+// agent. turnhive deliberately does not assume the sandbox's working
+// directory: all tool paths are relative to it.
+const skillsRoot = ".agents/skills"
 
 // Controller holds the dependencies shared by all HTTP handlers.
 type Controller struct {
@@ -118,14 +117,6 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to install skills"})
 		return
 	}
-	// Make sure the workspace exists regardless of the pool's pod
-	// template.
-	if err = sandbox.Mkdir(allocCtx, workspaceRoot, nil); err != nil {
-		log.Printf("create workspace: %v", err)
-		releaseSandbox(sandbox)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to prepare sandbox"})
-		return
-	}
 
 	var b [16]byte
 	_, _ = rand.Read(b[:])
@@ -142,7 +133,6 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		ModelName:     req.Model.Name,
 		SystemPrompt:  agent.BuildSystemPrompt(req.Prompt.System, skillRefs, skillsRoot),
 		Sandbox:       sandbox,
-		WorkspaceRoot: workspaceRoot,
 		ExternalTools: externalTools,
 		Waiter:        sess,
 		History:       agent.S3History(c.store, id),

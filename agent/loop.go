@@ -34,9 +34,6 @@ type LoopConfig struct {
 	// Sandbox is the session's ironhive sandbox; nil disables the
 	// sandbox tools.
 	Sandbox *ironhive.Sandbox
-	// WorkspaceRoot is the workspace root inside the sandbox, e.g.
-	// "/workspace".
-	WorkspaceRoot string
 	// ExternalTools are the client-defined tools executed externally.
 	ExternalTools []ExternalToolSpec
 	// Waiter supplies the results of external tool calls.
@@ -57,6 +54,7 @@ type Loop struct {
 	stream    func(ctx context.Context, req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error)
 	tools     []Tool
 	toolDefs  []llm.ToolDef
+	spiller   OutputSpiller
 	busy      atomic.Bool
 	mu        sync.Mutex
 	history   []llm.Message
@@ -67,7 +65,9 @@ type Loop struct {
 func NewLoop(cfg LoopConfig) *Loop {
 	l := &Loop{cfg: cfg, stream: llm.Stream}
 	if cfg.Sandbox != nil {
-		l.tools = append(l.tools, SandboxTools(cfg.Sandbox, cfg.WorkspaceRoot)...)
+		st := newSandboxTools(cfg.Sandbox)
+		l.tools = append(l.tools, st.list()...)
+		l.spiller = st
 	}
 	l.tools = append(l.tools, ExternalTools(cfg.ExternalTools, cfg.Waiter, cfg.ExternalToolTimeout)...)
 	l.toolDefs = toolSpecs(l.tools)
@@ -144,7 +144,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		working = append(working, msg)
 		for _, tc := range msg.ToolCalls {
 			r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallRunning})
-			out, err := dispatchTool(ctx, l.tools, tc.ID, tc.Name, tc.Arguments)
+			out, err := dispatchTool(ctx, l.tools, l.spiller, tc.ID, tc.Name, tc.Arguments)
 			var resultText string
 			if err != nil {
 				r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallError})

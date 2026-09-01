@@ -31,6 +31,9 @@ go.work.sum
 config.yml
 .tmp/
 
+# local reference projects (deliberately untracked)
+refs/
+
 # Editor/IDE
 # .idea/
 # .vscode/

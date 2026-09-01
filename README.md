@@ -35,7 +35,7 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
   },
   "prompt": {"system": "you are an agent"},               // 系统提示词
   "ironhive": {"pool": "default"},                        // 沙箱池
-  "skills": [                          // 可选；tar 包会以 presigned URL 注入沙箱 /skills/<name>/
+  "skills": [                          // 可选；tar 包会以 presigned URL 注入沙箱 ./.agents/skills/<name>/
     {"name": "code", "description": "...", "object_key": "skills/code.tar"}
   ],
   "mcp_servers": [                     // 可选（二期接入）

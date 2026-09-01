@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -193,10 +194,9 @@ func TestLoopSandboxToolCall(t *testing.T) {
 	fs.textReply("all done")
 	hist := &fakeHistory{}
 	l := newTestLoop(LoopConfig{
-		ModelName:     "test-model",
-		Sandbox:       sb,
-		WorkspaceRoot: "/workspace",
-		History:       hist,
+		ModelName: "test-model",
+		Sandbox:   sb,
+		History:   hist,
 	}, fs)
 
 	r := &fakeReporter{}
@@ -224,7 +224,7 @@ func TestLoopSandboxToolCall(t *testing.T) {
 			toolMsg = &req.Messages[i]
 		}
 	}
-	if toolMsg == nil || toolMsg.ToolCallID != "c1" || toolMsg.Content != "from-tool" {
+	if toolMsg == nil || toolMsg.ToolCallID != "c1" || toolMsg.Content != "from-tool\n(exit code: 0)" {
 		t.Fatalf("expected tool result in next request, got %+v", req.Messages)
 	}
 	foundAssistantCall := false
@@ -433,14 +433,15 @@ func TestLoopStreamErrorPersistsPartial(t *testing.T) {
 	}
 }
 
-func TestLoopShellToolTruncation(t *testing.T) {
-	sb, _ := newFakeIronhive(t)
+func TestLoopShellToolSpill(t *testing.T) {
+	sb, f := newFakeIronhive(t)
 	fs := &fakeStream{}
-	// Produce output beyond the byte limit and check it is truncated
-	// before going back to the model.
+	// Produce output beyond the strict limit; the full output must be
+	// spilled to a sandbox file and only a preview plus the file path go
+	// back to the model.
 	fs.toolCallReply(llm.ToolCall{ID: "c1", Name: "shell", Arguments: json.RawMessage(`{"command": "seq 1 5000"}`)})
 	fs.textReply("done")
-	l := newTestLoop(LoopConfig{ModelName: "test-model", Sandbox: sb, WorkspaceRoot: "/workspace"}, fs)
+	l := newTestLoop(LoopConfig{ModelName: "test-model", Sandbox: sb}, fs)
 
 	r := &fakeReporter{}
 	if err := l.RunTurn(context.Background(), "go", r); err != nil {
@@ -453,10 +454,22 @@ func TestLoopShellToolTruncation(t *testing.T) {
 			toolMsg = &req.Messages[i]
 		}
 	}
-	if toolMsg == nil || !strings.Contains(toolMsg.Content, "lines (") || !strings.Contains(toolMsg.Content, "truncated...") {
-		t.Fatalf("expected truncated tool output, got %q", toolMsg)
+	if toolMsg == nil {
+		t.Fatalf("no tool message in %+v", req.Messages)
 	}
-	if len(toolMsg.Content) > DefaultMaxBytes+4096 {
+	const spillPath = spillDir + "/shell-0001.txt"
+	if !strings.Contains(toolMsg.Content, "truncated...") || !strings.Contains(toolMsg.Content, "The full output was saved to: "+spillPath) {
+		t.Fatalf("expected spilled tool output, got (tail) %q", toolMsg.Content[len(toolMsg.Content)-300:])
+	}
+	if len(toolMsg.Content) > StrictMaxBytes+4096 {
 		t.Fatalf("tool output not bounded: %d bytes", len(toolMsg.Content))
+	}
+	// The spilled file really holds the full output in the sandbox.
+	full, err := os.ReadFile(f.local(spillPath))
+	if err != nil {
+		t.Fatalf("read spill file: %v", err)
+	}
+	if !strings.Contains(string(full), "5000") {
+		t.Fatalf("spill file incomplete: %d bytes", len(full))
 	}
 }

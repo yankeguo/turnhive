@@ -10,38 +10,70 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/llm"
 )
 
-// skillsSandboxRoot is the fixed read-only root inside the sandbox where
-// skills are installed; see InstallSkills.
-const skillsSandboxRoot = "/skills"
+// skillsRelRoot is the read-only skills tree, relative to the sandbox's
+// working directory; see InstallSkills.
+const skillsRelRoot = ".agents/skills"
 
-// shellToolTimeout is the fixed per-call timeout of the shell tool.
-// Cancelling the context makes the agent kill the command's process
-// group.
-const shellToolTimeout = 30 * time.Second
+// spillDir holds oversized tool outputs spilled to files, relative to the
+// sandbox's working directory; see SpillOutput. Same .agents root as the
+// skills tree, mirroring the agentdesk runner's tool-results layout.
+const spillDir = ".agents/tool-results"
+
+// shellForegroundWindow is how long a shell command may run in the
+// foreground. A command that outlives the window is NOT killed — it
+// moves to the background and the tool returns its PID and output file
+// paths, mirroring the agentdesk runner.
+const shellForegroundWindow = 30 * time.Second
+
+// shellLogsDir holds the per-call output files of the shell tool
+// (stdout/stderr/exit code), under the .agents root.
+const shellLogsDir = ".agents/shell-logs"
+
+// shellPidTimeout bounds the wait for the pid event that acknowledges a
+// successful spawn.
+const shellPidTimeout = 10 * time.Second
 
 // sandboxTools implements the five workspace tools against an ironhive
 // sandbox.
 type sandboxTools struct {
 	sb *ironhive.Sandbox
-	// root is the workspace root inside the sandbox, e.g. "/workspace".
-	root string
+	// spillN numbers the files written by SpillOutput.
+	spillN atomic.Int64
+
+	// shellMu guards the threaded shell state: the working directory and
+	// environment reported by the previous foreground shell call, fed back
+	// into the next one so cd/export persist within the session
+	// (ironhive's documented cwd/env event loop).
+	shellMu  sync.Mutex
+	shellCwd string
+	shellEnv []string
 }
 
 // SandboxTools returns the tools that operate inside the sandbox: read,
 // write, edit, apply_patch and shell.
 //
-// Tool file_path arguments are relative to workspaceRoot; absolute paths
-// are allowed only under workspaceRoot (read-write) or /skills
-// (read-only). Containment is lexical: paths are cleaned and any escape
-// from the two roots is rejected.
-func SandboxTools(sb *ironhive.Sandbox, workspaceRoot string) []Tool {
-	t := &sandboxTools{sb: sb, root: path.Clean(workspaceRoot)}
+// Tool file_path arguments are relative to the sandbox's working
+// directory (decided by the pool's pod template; turnhive does not
+// assume one). ".." escapes are rejected lexically, and the
+// .agents/skills tree is read-only. Absolute paths are passed through
+// untouched — the sandbox is single-use and disposable.
+func SandboxTools(sb *ironhive.Sandbox) []Tool {
+	return newSandboxTools(sb).list()
+}
+
+func newSandboxTools(sb *ironhive.Sandbox) *sandboxTools {
+	return &sandboxTools{sb: sb}
+}
+
+func (t *sandboxTools) list() []Tool {
 	return []Tool{
 		sandboxRead{t},
 		sandboxWrite{t},
@@ -51,62 +83,74 @@ func SandboxTools(sb *ironhive.Sandbox, workspaceRoot string) []Tool {
 	}
 }
 
-// resolveForRead resolves filePath against the sandbox for a read-only
-// operation, returning the absolute in-sandbox path. Both the workspace
-// root and /skills are accepted.
+// SpillOutput implements OutputSpiller: oversized tool output is written
+// to a freshly numbered file under .agents/tool-results (parent
+// directories are created by the sandbox agent) and its path returned
+// for the model.
+func (t *sandboxTools) SpillOutput(ctx context.Context, toolName, content string) (string, error) {
+	p := fmt.Sprintf("%s/%s-%04d.txt", spillDir, sanitizeFileName(toolName), t.spillN.Add(1))
+	if err := t.sb.PutFile(ctx, p, strings.NewReader(content), nil); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+// sanitizeFileName keeps a tool name safe for use as a file name
+// component.
+func sanitizeFileName(name string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, name)
+}
+
+// resolveForRead resolves filePath for a read-only operation, returning
+// the in-sandbox path to use.
 func (t *sandboxTools) resolveForRead(filePath string) (string, error) {
-	abs, _, err := t.resolve(filePath)
-	return abs, err
+	return t.resolve(filePath, false)
 }
 
 // resolveForWrite resolves filePath like resolveForRead but rejects the
-// read-only /skills root.
+// read-only .agents/skills tree.
 func (t *sandboxTools) resolveForWrite(filePath string) (string, error) {
-	abs, writable, err := t.resolve(filePath)
-	if err != nil {
-		return "", err
-	}
-	if !writable {
-		return "", fmt.Errorf("path is read-only: %s", filePath)
-	}
-	return abs, nil
+	return t.resolve(filePath, true)
 }
 
-// resolve cleans filePath and checks lexical containment in one of the
-// sandbox roots, returning the absolute path and whether the root it
-// landed in is writable.
-func (t *sandboxTools) resolve(filePath string) (abs string, writable bool, err error) {
+// resolve cleans filePath and rejects ".." escapes (and, for writes, the
+// read-only skills tree). Relative paths stay relative — they resolve
+// against the sandbox's working directory server-side. Absolute paths
+// pass through cleaned.
+func (t *sandboxTools) resolve(filePath string, write bool) (string, error) {
 	if filePath == "" {
-		return "", false, errors.New("file_path is required")
+		return "", errors.New("file_path is required")
 	}
 	if path.IsAbs(filePath) {
-		abs = path.Clean(filePath)
-		switch {
-		case abs == t.root || strings.HasPrefix(abs, t.root+"/"):
-			return abs, true, nil
-		case abs == skillsSandboxRoot || strings.HasPrefix(abs, skillsSandboxRoot+"/"):
-			return abs, false, nil
-		default:
-			return "", false, fmt.Errorf("path escapes workspace: %s", filePath)
-		}
+		return path.Clean(filePath), nil
 	}
 	rel := path.Clean(filePath)
 	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", false, fmt.Errorf("path escapes workspace: %s", filePath)
+		return "", fmt.Errorf("path escapes the working directory: %s", filePath)
 	}
-	return path.Join(t.root, rel), true, nil
+	if write && (rel == skillsRelRoot || strings.HasPrefix(rel, skillsRelRoot+"/")) {
+		return "", fmt.Errorf("path is read-only: %s", filePath)
+	}
+	return rel, nil
 }
 
-// getFile reads the whole file at the absolute in-sandbox path abs.
-func (t *sandboxTools) getFile(ctx context.Context, abs string) (string, error) {
-	r, err := t.sb.GetFile(ctx, abs)
+// getFile reads the whole file at the in-sandbox path p.
+func (t *sandboxTools) getFile(ctx context.Context, p string) (string, error) {
+	r, err := t.sb.GetFile(ctx, p)
 	if err != nil {
 		return "", err
 	}
 	defer r.Close()
 	body, err := io.ReadAll(r)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", abs, err)
+		return "", fmt.Errorf("read %s: %w", p, err)
 	}
 	return string(body), nil
 }
@@ -125,21 +169,27 @@ type filePathArgs struct {
 // ────────────────────────────── read ──────────────────────────────
 
 // sandboxRead implements the read tool: files are returned with 1-based
-// line numbers; directories as one entry per line.
+// line numbers; directories as one entry per line. read bounds its own
+// output with the generous DefaultMaxLines/DefaultMaxBytes budget, so
+// dispatchTool skips the generic (stricter) spill for it — see
+// selfTruncatingOutput.
 type sandboxRead struct{ t *sandboxTools }
+
+// selfTruncatingOutput marks read as bounding its own output.
+func (sandboxRead) selfTruncatingOutput() {}
 
 func (sandboxRead) Spec() llm.ToolDef {
 	return llm.ToolDef{
 		Name: "read",
-		Description: `Read a file or directory from the workspace. If the path does not exist, an error is returned.
+		Description: `Read a file or directory. If the path does not exist, an error is returned.
 
 Usage:
-- The file_path parameter should be relative to the workspace root.
-- For files: returns content with each line prefixed by its line number.
+- The file_path parameter is relative to the sandbox working directory.
+- For files: returns content with each line prefixed by its line number (1-based). Long files are truncated to fit the context; use grep via the shell tool to search the full content.
 - For directories: returns a list of entries (name, type, size).
 - Call this tool in parallel when reading multiple files.`,
 		Parameters: jsonSchema(map[string]any{
-			"file_path": stringProp("Path to read (file or directory). Relative to workspace, or absolute under the workspace root or /skills (read-only)"),
+			"file_path": stringProp("Path to read (file or directory). Relative to the sandbox working directory"),
 		}, "file_path"),
 	}
 }
@@ -149,15 +199,15 @@ func (s sandboxRead) Execute(ctx context.Context, _ string, args json.RawMessage
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
 	}
-	abs, err := s.t.resolveForRead(a.FilePath)
+	p, err := s.t.resolveForRead(a.FilePath)
 	if err != nil {
 		return "", err
 	}
 
-	content, err := s.t.getFile(ctx, abs)
+	content, err := s.t.getFile(ctx, p)
 	if err != nil {
 		// A directory cannot be fetched as a file; list it instead.
-		entries, lerr := s.t.sb.ListDir(ctx, abs)
+		entries, lerr := s.t.sb.ListDir(ctx, p)
 		if lerr != nil {
 			return "", err
 		}
@@ -181,7 +231,8 @@ func (s sandboxRead) Execute(ctx context.Context, _ string, args json.RawMessage
 	for i, line := range lines {
 		fmt.Fprintf(&b, "%d: %s\n", i+1, line)
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	return Truncate(strings.TrimRight(b.String(), "\n"), WithHint(
+		"Output was truncated. Use grep via the shell tool to search specific content in the full file.")), nil
 }
 
 // ────────────────────────────── write ──────────────────────────────
@@ -200,7 +251,7 @@ Usage:
 - ALWAYS prefer editing existing files. NEVER write new files unless explicitly required.
 - NEVER proactively create documentation files (*.md) or README files.`,
 		Parameters: jsonSchema(map[string]any{
-			"file_path": stringProp("Path to write. Relative to workspace, or absolute under the workspace root"),
+			"file_path": stringProp("Path to write. Relative to the sandbox working directory"),
 			"content":   stringProp("Content to write"),
 		}, "file_path", "content"),
 	}
@@ -241,7 +292,7 @@ Usage:
 - The edit will FAIL if old_string is found multiple times in the file.
   Either provide a larger string with more surrounding context to make it unique.`,
 		Parameters: jsonSchema(map[string]any{
-			"file_path":  stringProp("Path to edit. Relative to workspace, or absolute under the workspace root"),
+			"file_path":  stringProp("Path to edit. Relative to the sandbox working directory"),
 			"old_string": stringProp("Exact text to replace"),
 			"new_string": stringProp("Replacement text"),
 		}, "file_path", "old_string", "new_string"),
@@ -291,7 +342,7 @@ type sandboxApplyPatch struct{ t *sandboxTools }
 func (sandboxApplyPatch) Spec() llm.ToolDef {
 	return llm.ToolDef{
 		Name: "apply_patch",
-		Description: `Apply a unified-diff patch to workspace files. Multi-hunk, multi-file.
+		Description: `Apply a unified-diff patch to files. Multi-hunk, multi-file. Paths are relative to the sandbox working directory.
 
 Usage:
 - The patch should be in standard unified diff format.
@@ -349,28 +400,51 @@ func (s sandboxApplyPatch) Execute(ctx context.Context, _ string, args json.RawM
 // ────────────────────────────── shell ──────────────────────────────
 
 // sandboxShell implements the shell tool: a command run via bash inside
-// the sandbox with the workspace root as its working directory.
+// the sandbox. The working directory and exported variables are threaded
+// across foreground calls within the session (ironhive reports them as
+// cwd/env events; the next call feeds them back), so cd and export
+// persist.
+//
+// Output is redirected to per-call files under .agents/shell-logs from
+// the start, so a command that outlives the 30s foreground window (or
+// runs with bg: true) keeps writing after the tool returns; ironhive
+// reports the command's pid (its process group, Setpgid) as the first
+// SSE event, which is what the model signals to stop a backgrounded
+// command.
 type sandboxShell struct{ t *sandboxTools }
 
 func (sandboxShell) Spec() llm.ToolDef {
 	return llm.ToolDef{
 		Name: "shell",
-		Description: `Execute a shell command in the workspace directory.
+		Description: `Execute a shell command in the sandbox.
 
 Usage:
-- Commands run in the workspace root (cwd is locked).
+- The first command runs in the sandbox working directory; cd and exported variables (use export, not plain assignments) persist to subsequent foreground shell calls within the session.
 - Stdout and stderr are captured separately and merged in the response.
-- Commands time out after 30 seconds; a timed-out command is killed (whole process group).
+- Foreground commands return when they finish. A command still running after 30 seconds is NOT killed: it moves to the background and the tool returns its PID and stdout/stderr/exit-code file paths. Pass bg: true to get that behavior from the start (e.g. servers, watchers, long builds).
+- For backgrounded commands: poll output with tail/cat on the returned files; the exit-code file appears when the process exits; stop it (whole process group) with: kill -- -<pid>.
+- Backgrounded processes keep running even if the current turn ends; they die with the sandbox when the session is deleted.
 - Use for running scripts, build commands, git operations, etc.`,
 		Parameters: jsonSchema(map[string]any{
-			"command": stringProp("Shell command to execute (runs via bash in the workspace root)"),
+			"command": stringProp("Shell command to execute (runs via bash)"),
+			"bg":      boolProp("Run in background from the start: returns immediately with the PID and output file paths instead of waiting"),
 		}, "command"),
 	}
 }
 
-func (s sandboxShell) Execute(ctx context.Context, _ string, args json.RawMessage) (string, error) {
+// shellOutcome is the terminal state of one shell call, collected from
+// the SSE stream after the command exits.
+type shellOutcome struct {
+	exitCode int
+	cwd      string
+	env      map[string]string
+	err      error
+}
+
+func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawMessage) (string, error) {
 	var a struct {
 		Command string `json:"command"`
+		Bg      bool   `json:"bg"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -379,44 +453,174 @@ func (s sandboxShell) Execute(ctx context.Context, _ string, args json.RawMessag
 		return "", errors.New("command is required")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, shellToolTimeout)
-	defer cancel()
+	// Per-call output files. Inside the wrapper they are relative (the
+	// command runs in the threaded cwd, so the fake and the real sandbox
+	// both resolve them correctly); for read-back and for the model they
+	// are anchored at that same cwd, absolute once it is known — a
+	// backgrounded command's files stay findable after further cd-ing.
+	s.t.shellMu.Lock()
+	cwd := s.t.shellCwd
+	var opts *ironhive.ShellOptions
+	if cwd != "" || s.t.shellEnv != nil {
+		opts = &ironhive.ShellOptions{Cwd: cwd, Env: s.t.shellEnv, StrictEnv: true}
+	}
+	s.t.shellMu.Unlock()
 
-	var stdout, stderr strings.Builder
-	exitCode := 0
-	err := s.t.sb.Shell(ctx, a.Command, &ironhive.ShellOptions{Cwd: s.t.root}, func(ev ironhive.ShellEvent) error {
-		switch ev.Type {
-		case "stdout":
-			stdout.WriteString(ev.Data)
-			stdout.WriteByte('\n')
-		case "stderr":
-			stderr.WriteString(ev.Data)
-			stderr.WriteByte('\n')
-		case "exit":
-			if code, cerr := strconv.Atoi(strings.TrimSpace(ev.Data)); cerr == nil {
-				exitCode = code
+	base := shellLogsDir + "/" + sanitizeFileName(callID)
+	anchor := func(rel string) string {
+		if cwd == "" {
+			return rel
+		}
+		return path.Join(cwd, rel)
+	}
+	stdoutFile := anchor(base + ".stdout")
+	stderrFile := anchor(base + ".stderr")
+	exitFile := anchor(base + ".exit")
+
+	// The command runs detached from the tool call: cancelling the turn
+	// or returning early must not kill it (ironhive SIGTERMs the process
+	// group when the HTTP call aborts). Its lifetime is bounded by the
+	// sandbox — releasing the session kills the stream.
+	runCtx, runCancel := context.WithCancel(context.Background())
+	done := make(chan shellOutcome, 1)
+	pidCh := make(chan int, 1)
+	go func() {
+		defer runCancel()
+		var o shellOutcome
+		pidSent := false
+		err := s.t.sb.Shell(runCtx, buildShellWrapper(a.Command, shellLogsDir, base), opts, func(ev ironhive.ShellEvent) error {
+			switch ev.Type {
+			case "pid":
+				if !pidSent {
+					if pid, perr := strconv.Atoi(strings.TrimSpace(ev.Data)); perr == nil {
+						pidCh <- pid
+						pidSent = true
+					}
+				}
+			case "exit":
+				if code, cerr := strconv.Atoi(strings.TrimSpace(ev.Data)); cerr == nil {
+					o.exitCode = code
+				}
+			case "cwd":
+				o.cwd = strings.TrimSpace(ev.Data)
+			case "env":
+				// The event data is a JSON object of the full environment.
+				_ = json.Unmarshal([]byte(ev.Data), &o.env)
+			}
+			return nil
+		})
+		if err != nil {
+			o.err = err
+			done <- o
+			return
+		}
+		// The exit event reports the wrapper group's code (always 0); the
+		// real exit code is in the exit file. A SIGKILLed command leaves
+		// no exit file — fall back to the event.
+		if content, rerr := s.t.getFile(runCtx, exitFile); rerr == nil {
+			if code, cerr := strconv.Atoi(strings.TrimSpace(content)); cerr == nil {
+				o.exitCode = code
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return "", err
+		done <- o
+	}()
+
+	// Wait for the spawn acknowledgement (pid event) or an early failure.
+	var pid int
+	select {
+	case pid = <-pidCh:
+	case o := <-done:
+		if o.err != nil {
+			return "", o.err
+		}
+		// Finished before the pid arrived; treat as a fast foreground
+		// command regardless of bg.
+		return s.foregroundResult(ctx, o, stdoutFile, stderrFile)
+	case <-time.After(shellPidTimeout):
+		runCancel()
+		return "", errors.New("shell: no pid event within 10s; spawn likely failed")
+	case <-ctx.Done():
+		runCancel()
+		return "", ctx.Err()
 	}
 
-	var b strings.Builder
-	b.WriteString(strings.TrimRight(stdout.String(), "\n"))
-	if s := strings.TrimRight(stderr.String(), "\n"); s != "" {
-		if b.Len() > 0 {
-			b.WriteByte('\n')
+	if !a.Bg {
+		select {
+		case o := <-done:
+			if o.err != nil {
+				return "", o.err
+			}
+			return s.foregroundResult(ctx, o, stdoutFile, stderrFile)
+		case <-time.After(shellForegroundWindow):
+			// Not killed: falls through to the background reply. The
+			// outcome is discarded, so the threaded state only ever comes
+			// from commands that completed in the foreground.
+		case <-ctx.Done():
+			// Turn aborted: kill the still-foreground command's process
+			// group by cancelling the HTTP call.
+			runCancel()
+			return "", ctx.Err()
 		}
-		b.WriteString("--- stderr ---\n")
-		b.WriteString(s)
 	}
-	if exitCode != 0 {
-		if b.Len() > 0 {
-			b.WriteByte('\n')
+
+	return fmt.Sprintf("Command is running in the background (pid %d).\n"+
+		"stdout: %s\nstderr: %s\nexit code file (written on exit): %s\n"+
+		"Poll with tail/cat; stop it (whole process group) with: kill -- -%d",
+		pid, stdoutFile, stderrFile, exitFile, pid), nil
+}
+
+// foregroundResult threads the reported shell state into the next call
+// and formats the completed command's output from its files.
+func (s sandboxShell) foregroundResult(ctx context.Context, o shellOutcome, stdoutFile, stderrFile string) (string, error) {
+	s.t.shellMu.Lock()
+	if o.cwd != "" {
+		s.t.shellCwd = o.cwd
+	}
+	if o.env != nil {
+		env := make([]string, 0, len(o.env))
+		for k, v := range o.env {
+			env = append(env, k+"="+v)
 		}
-		fmt.Fprintf(&b, "exit code: %d", exitCode)
+		s.t.shellEnv = env
 	}
-	return b.String(), nil
+	s.t.shellMu.Unlock()
+
+	stdout, err := s.t.getFile(ctx, stdoutFile)
+	if err != nil {
+		return "", fmt.Errorf("read back stdout: %w", err)
+	}
+	stderr, err := s.t.getFile(ctx, stderrFile)
+	if err != nil {
+		return "", fmt.Errorf("read back stderr: %w", err)
+	}
+
+	// Output format mirrors the agentdesk runner: stdout, then the stderr
+	// section, "(no output)" when both are empty, and always the exit
+	// code.
+	out := strings.TrimRight(stdout, "\n")
+	errOut := strings.TrimRight(stderr, "\n")
+	var parts []string
+	if out != "" {
+		parts = append(parts, out)
+	}
+	if errOut != "" {
+		parts = append(parts, "[stderr]\n"+errOut)
+	}
+	if out == "" && errOut == "" {
+		parts = append(parts, "(no output)")
+	}
+	parts = append(parts, fmt.Sprintf("(exit code: %d)", o.exitCode))
+	return strings.Join(parts, "\n"), nil
+}
+
+// buildShellWrapper wraps command so its stdout/stderr and exit code go
+// to per-call files from the start: a command that moves to the
+// background keeps writing after the tool returns, and the foreground
+// read-back is byte-exact (no SSE line framing loss). The paths are
+// relative to the command's working directory; base is
+// ".agents/shell-logs/<call>".
+func buildShellWrapper(command, logDir, base string) string {
+	q := func(p string) string { return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'" }
+	return "mkdir -p " + q(logDir) + "\n{\n" + command + "\ncode=$?\n" +
+		"echo \"$code\" > " + q(base+".exit") + "\n} > " + q(base+".stdout") + " 2> " + q(base+".stderr")
 }

@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -73,5 +75,67 @@ func TestTruncateCustomHint(t *testing.T) {
 	got := Truncate(text, WithMaxLines(1), WithHint("custom hint"))
 	if !strings.HasSuffix(got, "custom hint") {
 		t.Fatalf("expected custom hint, got %q", got)
+	}
+}
+
+// fakeSpiller records spills and returns a fixed path.
+type fakeSpiller struct {
+	contents []string
+	path     string
+	err      error
+}
+
+func (f *fakeSpiller) SpillOutput(_ context.Context, _, content string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	f.contents = append(f.contents, content)
+	return f.path, nil
+}
+
+func TestTruncateSpillUnderLimitPassthrough(t *testing.T) {
+	spiller := &fakeSpiller{path: ".agents/tool-results/shell-0001.txt"}
+	text := "small output"
+	got := TruncateSpill(context.Background(), text, "shell", spiller)
+	if got != text {
+		t.Fatalf("expected passthrough, got %q", got)
+	}
+	if len(spiller.contents) != 0 {
+		t.Fatalf("spiller must not be called for small output")
+	}
+}
+
+func TestTruncateSpillOversized(t *testing.T) {
+	spiller := &fakeSpiller{path: ".agents/tool-results/shell-0001.txt"}
+	var lines []string
+	for range StrictMaxLines + 100 {
+		lines = append(lines, "some output line")
+	}
+	text := strings.Join(lines, "\n")
+
+	got := TruncateSpill(context.Background(), text, "shell", spiller)
+	if len(spiller.contents) != 1 || spiller.contents[0] != text {
+		t.Fatalf("expected full output spilled once, got %d spills", len(spiller.contents))
+	}
+	if !strings.Contains(got, "truncated...") || !strings.Contains(got, "The full output was saved to: .agents/tool-results/shell-0001.txt") {
+		t.Fatalf("expected spill hint, got (tail) %q", got[len(got)-200:])
+	}
+	if len(got) > StrictMaxBytes+4096 {
+		t.Fatalf("output not bounded: %d bytes", len(got))
+	}
+}
+
+func TestTruncateSpillFallback(t *testing.T) {
+	// No spiller, and a failing spiller, both degrade to plain strict
+	// truncation with the generic hint.
+	text := strings.Repeat("x\n", StrictMaxLines+10)
+	for _, spiller := range []OutputSpiller{nil, &fakeSpiller{err: errors.New("disk full")}} {
+		got := TruncateSpill(context.Background(), text, "shell", spiller)
+		if !strings.Contains(got, "truncated...") || !strings.HasSuffix(got, strictHint) {
+			t.Fatalf("expected plain truncation with strict hint, got (tail) %q", got[len(got)-200:])
+		}
+		if strings.Contains(got, "saved to") {
+			t.Fatalf("fallback must not mention a spill file: %q", got[len(got)-200:])
+		}
 	}
 }
