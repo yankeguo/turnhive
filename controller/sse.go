@@ -37,7 +37,10 @@ type syncMessage struct {
 // connect: the currently running turn ("" when idle), the latest
 // sequence number, the full merged history and the session's persisted
 // objects, so the client can synchronize its state in one frame before
-// the backlog replay. It carries an SSE id like any other frame.
+// the backlog replay. It deliberately carries no SSE id: it is a control
+// frame that does not occupy an event sequence number, and an id would
+// make EventSource record a stale Last-Event-ID, replaying already
+// received frames on reconnect (clients take the seq from the payload).
 func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []syncMessage, persisted []agent.PersistedObject) {
 	payload, err := json.Marshal(struct {
 		TurnID    string                  `json:"turn_id"`
@@ -48,5 +51,5 @@ func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []s
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintf(w, "id: %d\nevent: sync\ndata: %s\n\n", latestSeq, payload)
+	_, _ = fmt.Fprintf(w, "event: sync\ndata: %s\n\n", payload)
 }

@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/url"
@@ -170,7 +171,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := &Config{}
-	if err = yaml.Unmarshal(data, cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	// Reject unknown fields so misspelled keys (e.g. "idle_timetout")
+	// fail loudly instead of being silently ignored.
+	dec.KnownFields(true)
+	if err = dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -199,12 +204,14 @@ func (c *Config) setDefaults() {
 		}
 		c.Node.Advertise = "http://127.0.0.1:" + port
 	}
+	c.S3.Prefix = strings.Trim(c.S3.Prefix, "/")
 	if c.S3.Prefix == "" {
 		c.S3.Prefix = DefaultPrefix
 	}
 	if c.Etcd.DialTimeout == 0 {
 		c.Etcd.DialTimeout = Duration(DefaultEtcdDialTimeout)
 	}
+	c.Etcd.Prefix = strings.Trim(c.Etcd.Prefix, "/")
 	if c.Etcd.Prefix == "" {
 		c.Etcd.Prefix = DefaultPrefix
 	}
@@ -230,19 +237,19 @@ func (c *Config) validate() error {
 	if c.S3.Bucket == "" {
 		return fmt.Errorf("s3.bucket is required")
 	}
-	c.S3.Prefix = strings.Trim(c.S3.Prefix, "/")
 	if strings.Contains(c.S3.Prefix, "//") {
 		return fmt.Errorf("s3.prefix must not contain consecutive slashes")
 	}
 	if len(c.Etcd.Endpoints) == 0 {
 		return fmt.Errorf("etcd.endpoints is required")
 	}
-	c.Etcd.Prefix = strings.Trim(c.Etcd.Prefix, "/")
 	if strings.Contains(c.Etcd.Prefix, "//") {
 		return fmt.Errorf("etcd.prefix must not contain consecutive slashes")
 	}
-	if c.Etcd.LeaseTTL <= 0 {
-		return fmt.Errorf("etcd.lease_ttl must be positive")
+	// registry truncates the TTL to whole seconds for etcd Grant, so
+	// anything below 1s would register a lease that expires immediately.
+	if c.Etcd.LeaseTTL < Duration(time.Second) {
+		return fmt.Errorf("etcd.lease_ttl must be at least 1s")
 	}
 	if (c.Etcd.TLS.CertFile == "") != (c.Etcd.TLS.KeyFile == "") {
 		return fmt.Errorf("etcd.tls.cert_file and etcd.tls.key_file must be set together")

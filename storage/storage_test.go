@@ -121,6 +121,36 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func TestNewEndpointWithScheme(t *testing.T) {
+	cfg := testConfig("127.0.0.1:9000")
+	cfg.Endpoint = "http://127.0.0.1:9000"
+	if _, err := New(cfg); err == nil {
+		t.Fatal("New: expected error for endpoint with scheme, got nil")
+	} else if !strings.Contains(err.Error(), "must not include a scheme") {
+		t.Errorf("error = %q, want it to reject the scheme", err)
+	}
+}
+
+func TestGetObjectSizeLimit(t *testing.T) {
+	fake := newFakeS3()
+	fake.objects["turnhive/sessions/1/big.bin"] = make([]byte, maxGetObjectSize+1)
+	server := httptest.NewServer(fake)
+	defer server.Close()
+
+	s, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = s.GetObject(context.Background(), "sessions/1/big.bin")
+	if err == nil {
+		t.Fatal("GetObject: expected error for oversized object, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error = %q, want it to mention the size limit", err)
+	}
+}
+
 func TestPutGetObject(t *testing.T) {
 	server := httptest.NewServer(newFakeS3())
 	defer server.Close()

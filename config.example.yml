@@ -14,7 +14,9 @@ node:
   advertise: ""
 
 s3:
-  # S3-compatible service address. Leave empty for AWS default endpoints.
+  # S3-compatible service address, as bare host[:port] without a scheme
+  # (the scheme is selected by use_ssl). Leave empty for AWS default
+  # endpoints.
   # Examples: "s3.us-east-1.amazonaws.com", "minio.example.com", "127.0.0.1:9000"
   endpoint: ""
   region: us-east-1

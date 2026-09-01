@@ -147,18 +147,41 @@ func (t *sandboxTools) resolve(filePath string, write bool) (string, error) {
 	return rel, nil
 }
 
-// getFile reads the whole file at the in-sandbox path p.
+// maxGetFileBytes caps how much of a file getFile reads into memory, so
+// a pathological in-sandbox file (e.g. /dev/zero) cannot OOM the
+// process. The read tool uses getFileCapped to still show the head.
+const maxGetFileBytes = 8 * 1024 * 1024 // 8MB
+
+// getFile reads the whole file at the in-sandbox path p; files beyond
+// maxGetFileBytes are rejected (edit/apply_patch must never merge against
+// a partial read).
 func (t *sandboxTools) getFile(ctx context.Context, p string) (string, error) {
-	r, err := t.sb.GetFile(ctx, p)
+	body, truncated, err := t.getFileCapped(ctx, p, maxGetFileBytes)
 	if err != nil {
 		return "", err
 	}
-	defer r.Close()
-	body, err := io.ReadAll(r)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", p, err)
+	if truncated {
+		return "", fmt.Errorf("file too large: %s (limit %dMB)", p, maxGetFileBytes/1024/1024)
 	}
-	return string(body), nil
+	return body, nil
+}
+
+// getFileCapped reads at most limit bytes of the file at the in-sandbox
+// path p; truncated reports whether the file is larger than that.
+func (t *sandboxTools) getFileCapped(ctx context.Context, p string, limit int64) (body string, truncated bool, err error) {
+	r, err := t.sb.GetFile(ctx, p)
+	if err != nil {
+		return "", false, err
+	}
+	defer r.Close()
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return "", false, fmt.Errorf("read %s: %w", p, err)
+	}
+	if int64(len(data)) > limit {
+		return string(data[:limit]), true, nil
+	}
+	return string(data), false, nil
 }
 
 // isNotExist reports whether err is the sandbox agent's 404.
@@ -210,7 +233,7 @@ func (s sandboxRead) Execute(ctx context.Context, _ string, args json.RawMessage
 		return "", err
 	}
 
-	content, err := s.t.getFile(ctx, p)
+	content, capped, err := s.t.getFileCapped(ctx, p, maxGetFileBytes)
 	if err != nil {
 		// A directory cannot be fetched as a file; list it instead.
 		entries, lerr := s.t.sb.ListDir(ctx, p)
@@ -229,7 +252,10 @@ func (s sandboxRead) Execute(ctx context.Context, _ string, args json.RawMessage
 				fmt.Fprintf(&b, "%s (%d bytes)\n", e.Name, e.Size)
 			}
 		}
-		return strings.TrimRight(b.String(), "\n"), nil
+		// read bounds its own output; a huge directory listing is no
+		// exception.
+		return Truncate(strings.TrimRight(b.String(), "\n"), WithHint(
+			"Output was truncated. Use shell commands (ls, find) to list the directory in smaller slices.")), nil
 	}
 
 	lines := strings.Split(content, "\n")
@@ -237,8 +263,13 @@ func (s sandboxRead) Execute(ctx context.Context, _ string, args json.RawMessage
 	for i, line := range lines {
 		fmt.Fprintf(&b, "%d: %s\n", i+1, line)
 	}
-	return Truncate(strings.TrimRight(b.String(), "\n"), WithHint(
-		"Output was truncated. Use grep via the shell tool to search specific content in the full file.")), nil
+	out := Truncate(strings.TrimRight(b.String(), "\n"), WithHint(
+		"Output was truncated. Use grep via the shell tool to search specific content in the full file."))
+	if capped {
+		out += fmt.Sprintf("\n\nThe file exceeds the %dMB read limit; only its head is shown above. Use shell commands (grep, sed, tail) to inspect the rest.",
+			maxGetFileBytes/1024/1024)
+	}
+	return out, nil
 }
 
 // ────────────────────────────── write ──────────────────────────────
@@ -396,6 +427,13 @@ func (s sandboxApplyPatch) Execute(ctx context.Context, _ string, args json.RawM
 		modified = append(modified, f.toPath)
 	}
 
+	if len(modified) == 0 {
+		// parseUnifiedDiff silently drops input without a valid file
+		// section; reporting "Modified 0 files" would let the model
+		// believe the patch took effect.
+		return "", errors.New("no file sections found in patch")
+	}
+
 	plural := ""
 	if len(modified) != 1 {
 		plural = "s"
@@ -492,7 +530,11 @@ func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawM
 	pidCh := make(chan int, 1)
 	go func() {
 		defer runCancel()
-		var o shellOutcome
+		// exitCode starts at a sentinel: the exit event reports the
+		// wrapper group's code, and the real code comes from the exit
+		// file below. If both are missing or malformed, the reply must
+		// say "unknown" rather than lie about 0.
+		o := shellOutcome{exitCode: -1}
 		pidSent := false
 		err := s.t.sb.Shell(runCtx, buildShellWrapper(a.Command, shellLogsDir, base), opts, func(ev ironhive.ShellEvent) error {
 			switch ev.Type {
@@ -504,6 +546,10 @@ func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawM
 					}
 				}
 			case "exit":
+				// A malformed exit event leaves the sentinel in place;
+				// the exit file below is the authoritative source, and
+				// if that also fails the reply reads "(exit code:
+				// unknown)".
 				if code, cerr := strconv.Atoi(strings.TrimSpace(ev.Data)); cerr == nil {
 					o.exitCode = code
 				}
@@ -575,6 +621,10 @@ func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawM
 		pid, stdoutFile, stderrFile, exitFile, pid), nil
 }
 
+// maxShellReadBackBytes caps how much of a completed command's
+// stdout/stderr files is read back into the tool reply.
+const maxShellReadBackBytes = 4 * 1024 * 1024 // 4MB
+
 // foregroundResult threads the reported shell state into the next call
 // and formats the completed command's output from its files.
 func (s sandboxShell) foregroundResult(ctx context.Context, o shellOutcome, stdoutFile, stderrFile string) (string, error) {
@@ -582,7 +632,10 @@ func (s sandboxShell) foregroundResult(ctx context.Context, o shellOutcome, stdo
 	if o.cwd != "" {
 		s.t.shellCwd = o.cwd
 	}
-	if o.env != nil {
+	// An empty env event ("{}") unmarshals to a non-nil empty map; it
+	// must not clear the threaded environment — the next StrictEnv call
+	// would wipe every variable.
+	if len(o.env) > 0 {
 		env := make([]string, 0, len(o.env))
 		for k, v := range o.env {
 			env = append(env, k+"="+v)
@@ -591,11 +644,11 @@ func (s sandboxShell) foregroundResult(ctx context.Context, o shellOutcome, stdo
 	}
 	s.t.shellMu.Unlock()
 
-	stdout, err := s.t.getFile(ctx, stdoutFile)
+	stdout, stdoutCapped, err := s.t.getFileCapped(ctx, stdoutFile, maxShellReadBackBytes)
 	if err != nil {
 		return "", fmt.Errorf("read back stdout: %w", err)
 	}
-	stderr, err := s.t.getFile(ctx, stderrFile)
+	stderr, stderrCapped, err := s.t.getFileCapped(ctx, stderrFile, maxShellReadBackBytes)
 	if err != nil {
 		return "", fmt.Errorf("read back stderr: %w", err)
 	}
@@ -615,7 +668,15 @@ func (s sandboxShell) foregroundResult(ctx context.Context, o shellOutcome, stdo
 	if out == "" && errOut == "" {
 		parts = append(parts, "(no output)")
 	}
-	parts = append(parts, fmt.Sprintf("(exit code: %d)", o.exitCode))
+	if stdoutCapped || stderrCapped {
+		parts = append(parts, fmt.Sprintf("Output exceeded the %dMB read-back limit and was cut off. The full output is in the sandbox at %s and %s; inspect it with tail/grep.",
+			maxShellReadBackBytes/1024/1024, stdoutFile, stderrFile))
+	}
+	if o.exitCode >= 0 {
+		parts = append(parts, fmt.Sprintf("(exit code: %d)", o.exitCode))
+	} else {
+		parts = append(parts, "(exit code: unknown)")
+	}
 	return strings.Join(parts, "\n"), nil
 }
 

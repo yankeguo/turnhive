@@ -31,6 +31,9 @@ const headerForwarded = "X-Turnhive-Forwarded"
 // lookupTimeout bounds etcd ownership lookups on the request path.
 const lookupTimeout = 5 * time.Second
 
+// maxJSONBody bounds the request body of the JSON-decoding endpoints.
+const maxJSONBody = 4 << 20
+
 // allocateTimeout bounds sandbox allocation; ironhive may block up to 30s
 // server-side waiting for a standby pod.
 const allocateTimeout = 40 * time.Second
@@ -121,10 +124,10 @@ func (c *Controller) runSweeper() {
 func (c *Controller) reapIdleSandboxes() {
 	c.sessions.Range(func(_, v any) bool {
 		sess, ok := v.(*Session)
-		if !ok || !sess.idle(c.idleTimeout) {
+		if !ok {
 			return true
 		}
-		sb, stop := sess.takeSandbox()
+		sb, stop := sess.takeSandboxIfIdle(c.idleTimeout)
 		if sb == nil {
 			return true
 		}
@@ -156,6 +159,7 @@ func (c *Controller) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // its ownership record so any node in the cluster can route to it.
 func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req CreateSessionRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -198,15 +202,21 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
+// skillRefsOf converts the session spec's skills to agent skill refs.
+func skillRefsOf(skills []SkillSpec) []agent.SkillRef {
+	refs := make([]agent.SkillRef, 0, len(skills))
+	for _, s := range skills {
+		refs = append(refs, agent.SkillRef{Name: s.Name, Description: s.Description, ObjectKey: s.ObjectKey})
+	}
+	return refs
+}
+
 // buildLoop creates the agent Loop for a session from its spec and the
 // given sandbox. Called at creation and every time the sandbox is
 // rebuilt after an idle reap.
 func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.Loop {
 	req := sess.Spec
-	skillRefs := make([]agent.SkillRef, 0, len(req.Skills))
-	for _, s := range req.Skills {
-		skillRefs = append(skillRefs, agent.SkillRef{Name: s.Name, Description: s.Description, ObjectKey: s.ObjectKey})
-	}
+	skillRefs := skillRefsOf(req.Skills)
 	externalTools := make([]agent.ExternalToolSpec, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		externalTools = append(externalTools, agent.ExternalToolSpec{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
@@ -241,11 +251,7 @@ func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
 	if err != nil {
 		return fmt.Errorf("allocate sandbox from pool %q: %w", sess.Spec.Ironhive.Pool, err)
 	}
-	skillRefs := make([]agent.SkillRef, 0, len(sess.Spec.Skills))
-	for _, s := range sess.Spec.Skills {
-		skillRefs = append(skillRefs, agent.SkillRef{Name: s.Name, Description: s.Description, ObjectKey: s.ObjectKey})
-	}
-	if err = agent.InstallSkills(ctx, sandbox, c.store, skillRefs, skillsRoot, skillURLTTL); err != nil {
+	if err = agent.InstallSkills(ctx, sandbox, c.store, skillRefsOf(sess.Spec.Skills), skillsRoot, skillURLTTL); err != nil {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("install skills: %w", err)
 	}
@@ -258,12 +264,19 @@ func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("load history: %w", err)
 	}
-	sess.Loop = l
+	sess.setLoop(l)
 	// Keep the sandbox lease alive while the session holds it; without
 	// renewal ironhive destroys the sandbox when the lease expires.
 	renewCtx, stopRenew := context.WithCancel(context.Background())
 	go c.renewSandbox(renewCtx, sandbox)
-	sess.setSandbox(sandbox, stopRenew)
+	if !sess.setSandbox(sandbox, stopRenew) {
+		// The session was deleted (or the node is shutting down) while
+		// the sandbox was being rebuilt; stop the renewal and release
+		// the sandbox instead of leaking both.
+		stopRenew()
+		releaseSandbox(sandbox)
+		return errors.New("session closed during sandbox rebuild")
+	}
 	return nil
 }
 
@@ -308,6 +321,7 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req CreateMessageRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -349,7 +363,7 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 			rep.Error("failed to prepare sandbox")
 			return
 		}
-		if err := sess.Loop.RunTurn(ctx, req.Content, rep); err != nil {
+		if err := sess.getLoop().RunTurn(ctx, req.Content, rep); err != nil {
 			if errors.Is(err, agent.ErrBusy) {
 				// Unreachable given startTurn; publish so subscribers are
 				// not stuck watching an open turn.
@@ -401,7 +415,7 @@ func (c *Controller) handleSessionEvents(w http.ResponseWriter, r *http.Request)
 	// The sync frame carries the full merged history (completed turns as
 	// {user, assistant} pairs) so a fresh client synchronizes in one
 	// frame; the backlog then only matters for in-flight progress.
-	history := sess.Loop.Messages()
+	history := sess.getLoop().Messages()
 	messages := make([]syncMessage, 0, len(history))
 	for _, m := range history {
 		messages = append(messages, syncMessage{Role: m.Role, Content: m.Content})
@@ -442,6 +456,7 @@ func (c *Controller) handleCreateToolResult(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req ToolResultRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
@@ -458,7 +473,10 @@ func (c *Controller) handleCreateToolResult(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 		return
 	}
-	v.(*Session).AddToolResult(req)
+	if err := v.(*Session).AddToolResult(req); err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
@@ -472,7 +490,7 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	c.sessions.Delete(id)
 	if sess, ok := v.(*Session); ok {
 		sess.cancelTurn()
-		if sb, stop := sess.takeSandbox(); sb != nil {
+		if sb, stop := sess.closeSession(); sb != nil {
 			if stop != nil {
 				stop()
 			}
@@ -499,7 +517,7 @@ func (c *Controller) Close() {
 		c.sessions.Delete(key)
 		if sess, ok := v.(*Session); ok {
 			sess.cancelTurn()
-			if sb, stop := sess.takeSandbox(); sb != nil {
+			if sb, stop := sess.closeSession(); sb != nil {
 				if stop != nil {
 					stop()
 				}
@@ -548,19 +566,28 @@ func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id str
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
 		return false
 	}
-	c.proxy(addr).ServeHTTP(w, r)
+	p, err := c.proxy(addr)
+	if err != nil {
+		// The address came from etcd (written by another, possibly
+		// misbehaving or outdated node): report a bad gateway instead of
+		// taking this process down.
+		log.Printf("session %s owner address: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "invalid session owner address"})
+		return false
+	}
+	p.ServeHTTP(w, r)
 	return false
 }
 
-// proxy returns the cached reverse proxy for the given owner node address.
-func (c *Controller) proxy(addr string) *httputil.ReverseProxy {
+// proxy returns the cached reverse proxy for the given owner node
+// address. The address comes from etcd, so it is validated here.
+func (c *Controller) proxy(addr string) (*httputil.ReverseProxy, error) {
 	if p, ok := c.proxies.Load(addr); ok {
-		return p.(*httputil.ReverseProxy)
+		return p.(*httputil.ReverseProxy), nil
 	}
 	target, err := url.Parse(addr)
-	if err != nil {
-		// node.advertise is validated at startup, so this cannot happen.
-		log.Fatalf("invalid node address %q: %v", addr, err)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return nil, fmt.Errorf("invalid node address %q", addr)
 	}
 	p := httputil.NewSingleHostReverseProxy(target)
 	p.FlushInterval = -1 // stream responses (SSE) without buffering
@@ -571,7 +598,7 @@ func (c *Controller) proxy(addr string) *httputil.ReverseProxy {
 		req.Header.Set(headerForwarded, "1")
 	}
 	actual, _ := c.proxies.LoadOrStore(addr, p)
-	return actual.(*httputil.ReverseProxy)
+	return actual.(*httputil.ReverseProxy), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

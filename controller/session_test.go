@@ -1,9 +1,16 @@
 package controller
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/agent"
 )
 
@@ -64,5 +71,191 @@ func TestSessionRecordPersisted(t *testing.T) {
 	// Sorted by path; b.txt carries the latest size.
 	if got[0].Path != "a.txt" || got[1].Path != "b.txt" || got[1].Size != 3 {
 		t.Fatalf("unexpected persisted objects: %+v", got)
+	}
+}
+
+func TestTakeSandboxIfIdle(t *testing.T) {
+	sess := &Session{ID: "s"}
+	if !sess.setSandbox(&ironhive.Sandbox{Name: "sb"}, func() {}) {
+		t.Fatal("setSandbox on a fresh session must succeed")
+	}
+	sess.touch()
+
+	// Recently active: nothing is detached.
+	if sb, stop := sess.takeSandboxIfIdle(time.Minute); sb != nil || stop != nil {
+		t.Fatal("active session must not be reaped")
+	}
+
+	// Idle but a turn is running: nothing is detached.
+	sess.mu.Lock()
+	sess.lastActivity = time.Now().Add(-time.Hour)
+	sess.mu.Unlock()
+	if !sess.startTurn("turn-1", func() {}) {
+		t.Fatal("startTurn must succeed")
+	}
+	if sb, _ := sess.takeSandboxIfIdle(time.Minute); sb != nil {
+		t.Fatal("sandbox of a running turn must not be reaped")
+	}
+	sess.finishTurn()
+
+	// Idle and no turn: the sandbox and its renew cancel are detached.
+	sb, stop := sess.takeSandboxIfIdle(time.Minute)
+	if sb == nil || stop == nil {
+		t.Fatal("idle session with no turn must be reaped")
+	}
+	if sess.hasSandbox() {
+		t.Fatal("sandbox must be detached after reap")
+	}
+	// Nothing left to reap.
+	if sb, _ := sess.takeSandboxIfIdle(0); sb != nil {
+		t.Fatal("second reap must find no sandbox")
+	}
+}
+
+// TestTakeSandboxIfIdleRace hammers startTurn against the reaper's
+// check-and-detach critical section; run with -race. The sandbox must
+// never be detached out from under a running turn.
+func TestTakeSandboxIfIdleRace(t *testing.T) {
+	sess := &Session{ID: "s"}
+	stop := func() {}
+	sess.setSandbox(&ironhive.Sandbox{Name: "sb"}, stop)
+	sess.mu.Lock()
+	sess.lastActivity = time.Now().Add(-time.Hour)
+	sess.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 500 {
+				if sess.startTurn("turn-x", func() {}) {
+					sess.finishTurn()
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 500 {
+			sb, stopFn := sess.takeSandboxIfIdle(time.Minute)
+			if sb == nil {
+				continue
+			}
+			if sess.hasSandbox() {
+				t.Error("sandbox still attached after reap")
+			}
+			sess.setSandbox(sb, stopFn)
+		}
+	}()
+	wg.Wait()
+}
+
+func TestSetSandboxAfterClose(t *testing.T) {
+	sess := &Session{ID: "s"}
+	if !sess.setSandbox(&ironhive.Sandbox{Name: "sb1"}, func() {}) {
+		t.Fatal("setSandbox on a fresh session must succeed")
+	}
+	sb, stop := sess.closeSession()
+	if sb == nil || stop == nil {
+		t.Fatal("closeSession must detach the sandbox and renew cancel")
+	}
+	// A sandbox rebuilt concurrently with DELETE/Close must be refused.
+	if sess.setSandbox(&ironhive.Sandbox{Name: "sb2"}, func() {}) {
+		t.Fatal("setSandbox must refuse a closed session")
+	}
+	if sess.hasSandbox() {
+		t.Fatal("closed session must not hold a sandbox")
+	}
+	if sb, stop := sess.closeSession(); sb != nil || stop != nil {
+		t.Fatal("second closeSession must find nothing to detach")
+	}
+}
+
+func TestToolResultBeforeWait(t *testing.T) {
+	sess := &Session{}
+	if err := sess.AddToolResult(ToolResultRequest{CallID: "c1", Result: json.RawMessage(`{"ok":true}`)}); err != nil {
+		t.Fatalf("AddToolResult: %v", err)
+	}
+	res, errStr, err := sess.WaitToolResult(context.Background(), "c1")
+	if err != nil || errStr != "" || string(res) != `{"ok":true}` {
+		t.Fatalf("WaitToolResult = %s, %q, %v", res, errStr, err)
+	}
+	// The pending entry is consumed, not replayed.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := sess.WaitToolResult(ctx, "c1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("consumed result must not be replayed, got %v", err)
+	}
+}
+
+func TestToolResultAfterWait(t *testing.T) {
+	sess := &Session{}
+	type outcome struct {
+		res    json.RawMessage
+		errStr string
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, errStr, err := sess.WaitToolResult(context.Background(), "c2")
+		done <- outcome{res, errStr, err}
+	}()
+	// Wait until the waiter is registered before reporting the result.
+	for range 100 {
+		sess.mu.Lock()
+		n := len(sess.waiters)
+		sess.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := sess.AddToolResult(ToolResultRequest{CallID: "c2", Error: "boom"}); err != nil {
+		t.Fatalf("AddToolResult: %v", err)
+	}
+	select {
+	case o := <-done:
+		if o.err != nil || o.errStr != "boom" || len(o.res) != 0 {
+			t.Fatalf("WaitToolResult = %s, %q, %v", o.res, o.errStr, o.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter was not released by the reported result")
+	}
+}
+
+func TestFinishTurnClearsPending(t *testing.T) {
+	sess := &Session{}
+	if !sess.startTurn("turn-1", func() {}) {
+		t.Fatal("startTurn must succeed")
+	}
+	// A result reported for a call nobody waits on (late or forged).
+	if err := sess.AddToolResult(ToolResultRequest{CallID: "stale", Result: json.RawMessage(`1`)}); err != nil {
+		t.Fatalf("AddToolResult: %v", err)
+	}
+	sess.finishTurn()
+	// The stale result must not leak into the next turn.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, _, err := sess.WaitToolResult(ctx, "stale"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stale pending result survived finishTurn: %v", err)
+	}
+}
+
+func TestAddToolResultPendingCap(t *testing.T) {
+	sess := &Session{}
+	for i := range pendingToolResultsCap {
+		if err := sess.AddToolResult(ToolResultRequest{CallID: fmt.Sprintf("c%d", i), Result: json.RawMessage(`1`)}); err != nil {
+			t.Fatalf("AddToolResult %d: %v", i, err)
+		}
+	}
+	// A new unknown call id over the cap is rejected.
+	if err := sess.AddToolResult(ToolResultRequest{CallID: "overflow", Result: json.RawMessage(`1`)}); err == nil {
+		t.Fatal("expected pending-cap error")
+	}
+	// Re-reporting a known call id still succeeds (replace in place).
+	if err := sess.AddToolResult(ToolResultRequest{CallID: "c0", Result: json.RawMessage(`2`)}); err != nil {
+		t.Fatalf("re-report of a known call id: %v", err)
 	}
 }

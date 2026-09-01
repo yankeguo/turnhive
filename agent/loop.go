@@ -94,7 +94,9 @@ func NewLoop(cfg LoopConfig) *Loop {
 	return l
 }
 
-// Messages returns the persisted history (for tests/debug).
+// Messages returns the persisted history. It is the production data
+// source of the events sync frame (controller rebuilds the merged
+// message list from it), not a tests-only accessor.
 func (l *Loop) Messages() []llm.Message {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -125,10 +127,10 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		l.history = trimmed
 		l.mu.Unlock()
 		if changed {
-			if err := l.saveHistory(ctx); err != nil {
-				r.Error(err.Error())
-				return err
-			}
+			// History saving is best-effort: the in-memory history is
+			// authoritative, so a failed save degrades to continuing
+			// the turn instead of aborting it.
+			_ = l.saveHistory(ctx)
 		}
 	}
 
@@ -143,8 +145,9 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 	}
 	working = append(working, userMsg)
 
+	var stepText strings.Builder
 	for step := 0; step < maxTurnSteps; step++ {
-		var stepText strings.Builder
+		stepText.Reset()
 		msg, usage, err := l.stream(ctx, llm.Request{
 			URL:      l.cfg.ModelURL,
 			Headers:  l.cfg.ModelHeaders,
@@ -176,12 +179,12 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 				l.history = CompactMessages(l.history)
 				l.mu.Unlock()
 			}
-			if err := l.saveHistory(ctx); err != nil {
-				r.Error(err.Error())
-				return err
-			}
+			// The client already received every delta: report success
+			// first, then persist. A failed save is returned so the
+			// caller can log it, but never reported as a turn error —
+			// the in-memory history is authoritative.
 			r.Done(msg.Content)
-			return nil
+			return l.saveHistory(ctx)
 		}
 
 		working = append(working, msg)
@@ -191,7 +194,9 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 			var resultText string
 			if err != nil {
 				r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallError})
-				resultText = "error: " + err.Error()
+				// Bound the error text like any other non-read tool
+				// output before feeding it back to the model.
+				resultText = "error: " + Truncate(err.Error(), WithMaxLines(StrictMaxLines), WithMaxBytes(StrictMaxBytes), WithHint(strictHint))
 			} else {
 				r.ToolCall(ToolCallEvent{ID: tc.ID, Name: tc.Name, Status: ToolCallDone})
 				resultText = out
@@ -206,9 +211,9 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		}
 	}
 
-	err := errors.New("max steps exceeded")
-	r.Error(err.Error())
-	return err
+	// Persist the {user, assistant-partial} pair like any other failed
+	// turn, so a rebuilt session keeps what was said.
+	return l.failTurn(ctx, r, userMsg, stepText.String(), errors.New("max steps exceeded"))
 }
 
 // LoadHistory eagerly loads the persisted history. RunTurn also loads
@@ -258,11 +263,16 @@ func (l *Loop) saveHistory(ctx context.Context) error {
 }
 
 // failTurn ends a turn after a stream error or cancellation: the partial
-// assistant text accumulated so far is persisted, the save is
-// best-effort, and the error is reported and returned.
+// assistant text accumulated so far is persisted (best-effort), and the
+// error is reported and returned.
 func (l *Loop) failTurn(ctx context.Context, r Reporter, userMsg llm.Message, partialText string, err error) error {
 	l.appendHistory(userMsg, llm.Message{Role: "assistant", Content: partialText})
-	_ = l.saveHistory(ctx)
+	// ctx may already be cancelled (session deleted, controller closing,
+	// turn timeout): save under a detached context so the partial reply
+	// still reaches the history store.
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	_ = l.saveHistory(saveCtx)
 	r.Error(err.Error())
 	return err
 }

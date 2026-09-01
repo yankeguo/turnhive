@@ -58,6 +58,9 @@ func main() {
 	srv := &http.Server{
 		Addr:    cfg.Listen,
 		Handler: mux,
+		// Bound header read time only; SSE connections are long-lived, so
+		// no Read/Write/Idle timeouts can be set here.
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -78,10 +81,14 @@ func main() {
 	case <-ctx.Done():
 	}
 
+	failed := false
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("graceful shutdown failed: %v", err)
+		// Degrade to a warning: the cleanup below (cancelling turns and
+		// releasing sandboxes) must still run before exiting non-zero.
+		log.Printf("graceful shutdown failed: %v", err)
+		failed = true
 	}
 	// Release the sandboxes of every session this node owns; otherwise
 	// they leak until their ironhive lease expires.
@@ -95,6 +102,9 @@ func main() {
 		log.Printf("deregister node: %v", err)
 	}
 	log.Println("server stopped")
+	if failed {
+		os.Exit(1)
+	}
 }
 
 // newEtcdClient builds an etcd client from the configuration, including

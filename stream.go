@@ -98,12 +98,18 @@ type eventPayload struct {
 	Persisted []PersistedObject `json:"persisted"`
 }
 
-// Stream is the event stream of one turn, returned by SendMessage.
-// Events must be consumed until the channel closes; then Err reports
-// whether the stream ended cleanly. Close abandons the stream early.
+// Stream is the session-level event stream returned by Client.Events. It
+// carries the events of every turn of the session; the stream ends only
+// when the connection breaks or Close is called — a finished turn does
+// not close it. Events must be consumed until the channel closes; then
+// Err reports whether the stream ended cleanly. Close abandons the
+// stream early.
 type Stream struct {
 	body   io.ReadCloser
 	events chan Event
+	done   chan struct{}
+
+	closeOnce sync.Once
 
 	mu     sync.Mutex
 	err    error
@@ -111,13 +117,13 @@ type Stream struct {
 }
 
 func newStream(body io.ReadCloser) *Stream {
-	s := &Stream{body: body, events: make(chan Event, 16)}
+	s := &Stream{body: body, events: make(chan Event, 16), done: make(chan struct{})}
 	go s.run()
 	return s
 }
 
-// Events returns the channel of turn events. It is closed when the turn
-// ends, the stream breaks, or Close is called.
+// Events returns the channel of session events. It is closed when the
+// connection breaks or Close is called.
 func (s *Stream) Events() <-chan Event {
 	return s.events
 }
@@ -136,6 +142,7 @@ func (s *Stream) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
+	s.closeOnce.Do(func() { close(s.done) })
 	return s.body.Close()
 }
 
@@ -175,7 +182,8 @@ func (s *Stream) run() {
 			// the payload.
 			seq = p.Seq
 		}
-		s.events <- Event{
+		select {
+		case s.events <- Event{
 			Type:      EventType(name),
 			Seq:       seq,
 			TurnID:    p.TurnID,
@@ -187,8 +195,14 @@ func (s *Stream) run() {
 			Message:   p.Message,
 			Messages:  p.Messages,
 			Persisted: p.Persisted,
+		}:
+			return true
+		case <-s.done:
+			// Close was called while the consumer stopped draining; exit
+			// through the normal finish path instead of leaking run.
+			s.finish(nil)
+			return false
 		}
-		return true
 	}
 
 	for {
@@ -233,7 +247,11 @@ func parseLine(line string, name *string, data *strings.Builder, frameSeq *int64
 		return
 	}
 	if v, ok := strings.CutPrefix(line, "id:"); ok {
-		*frameSeq, _ = strconv.ParseInt(strings.TrimPrefix(v, " "), 10, 64)
+		// Leave frameSeq untouched on a malformed id so dispatch falls
+		// back to the seq carried in the payload.
+		if n, err := strconv.ParseInt(strings.TrimPrefix(v, " "), 10, 64); err == nil {
+			*frameSeq = n
+		}
 		return
 	}
 	if v, ok := strings.CutPrefix(line, "data:"); ok {

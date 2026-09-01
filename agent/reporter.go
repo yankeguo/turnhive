@@ -15,8 +15,6 @@ type ToolCallEvent struct {
 	ID string `json:"id"`
 	// Name is the tool name.
 	Name string `json:"name"`
-	// Title is an optional human-readable title for the call.
-	Title string `json:"title,omitempty"`
 	// Status is "running", "done" or "error".
 	Status string `json:"status"`
 }

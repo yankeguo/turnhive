@@ -139,7 +139,9 @@ func (s sandboxPersist) Execute(ctx context.Context, _ string, args json.RawMess
 
 	if s.onPersisted != nil {
 		s.onPersisted(PersistedObject{
-			Path:      a.FilePath,
+			// Record the cleaned path, not the raw argument, so "./x"
+			// and "x" dedupe to the same session record.
+			Path:      p,
 			ObjectKey: key,
 			Size:      size,
 			At:        time.Now().UTC(),

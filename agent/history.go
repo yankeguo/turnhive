@@ -46,9 +46,22 @@ func (s *s3HistoryStore) Load(ctx context.Context) ([]llm.Message, error) {
 		}
 		return nil, err
 	}
+	msgs, err := parseHistoryJSONL(body)
+	if err != nil {
+		return nil, fmt.Errorf("read history %q: %w", s.key, err)
+	}
+	return msgs, nil
+}
+
+// parseHistoryJSONL parses the JSONL history. A single malformed line is
+// skipped rather than failing the whole load — losing one line beats
+// bricking the session (a failed Load never marks the history ready, so
+// every later turn would fail too).
+func parseHistoryJSONL(body []byte) ([]llm.Message, error) {
 	var msgs []llm.Message
 	sc := bufio.NewScanner(bytes.NewReader(body))
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	// Allow very large single lines (e.g. a persisted long reply).
+	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
@@ -56,12 +69,12 @@ func (s *s3HistoryStore) Load(ctx context.Context) ([]llm.Message, error) {
 		}
 		var msg llm.Message
 		if err := json.Unmarshal(line, &msg); err != nil {
-			return nil, fmt.Errorf("parse history %q: %w", s.key, err)
+			continue
 		}
 		msgs = append(msgs, msg)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("read history %q: %w", s.key, err)
+		return nil, err
 	}
 	return msgs, nil
 }

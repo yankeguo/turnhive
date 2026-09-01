@@ -23,17 +23,22 @@ const ProtocolOpenAICompletions = "openai_completions"
 type Session struct {
 	ID   string
 	Spec CreateSessionRequest
-	// Sandbox is the ironhive sandbox allocated for this session.
+	// Sandbox is the ironhive sandbox allocated for this session; access
+	// it through the mu-guarded helpers below.
 	Sandbox *ironhive.Sandbox
-	// Loop runs the agent turns of this session.
-	Loop *agent.Loop
 	// hub sequences, buffers and fans out the session's events (see
 	// hub.go).
 	hub *eventHub
-	// stopRenew cancels the sandbox lease renewal loop of this session.
-	stopRenew context.CancelFunc
 
 	mu sync.Mutex
+	// loop runs the agent turns of this session; it is rebuilt together
+	// with the sandbox.
+	loop *agent.Loop
+	// stopRenew cancels the sandbox lease renewal loop of this session.
+	stopRenew context.CancelFunc
+	// closed is set when the session is torn down (DELETE, shutdown); a
+	// sandbox rebuilt concurrently must not attach to it afterwards.
+	closed bool
 	// turnID is the currently running turn ("" when idle); turns run
 	// detached from the HTTP request that started them.
 	turnID string
@@ -62,14 +67,6 @@ func (s *Session) touch() {
 	s.mu.Unlock()
 }
 
-// idle reports whether the session has been inactive for at least d and
-// no turn is running.
-func (s *Session) idle(d time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.turnID == "" && time.Since(s.lastActivity) >= d
-}
-
 // hasSandbox reports whether the session currently holds a sandbox.
 func (s *Session) hasSandbox() bool {
 	s.mu.Lock()
@@ -78,16 +75,22 @@ func (s *Session) hasSandbox() bool {
 }
 
 // setSandbox installs a freshly built sandbox and its lease-renewal
-// cancel func.
-func (s *Session) setSandbox(sb *ironhive.Sandbox, stopRenew context.CancelFunc) {
+// cancel func. It returns false when the session was closed while the
+// sandbox was being built; the caller must then stop the renewal and
+// release the sandbox itself.
+func (s *Session) setSandbox(sb *ironhive.Sandbox, stopRenew context.CancelFunc) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	s.Sandbox = sb
 	s.stopRenew = stopRenew
-	s.mu.Unlock()
+	return true
 }
 
 // takeSandbox detaches the session's sandbox and its renew cancel func,
-// returning them for release (idle reaper, DELETE, shutdown).
+// returning them for release (session creation rollback).
 func (s *Session) takeSandbox() (*ironhive.Sandbox, context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -95,6 +98,52 @@ func (s *Session) takeSandbox() (*ironhive.Sandbox, context.CancelFunc) {
 	s.Sandbox = nil
 	s.stopRenew = nil
 	return sb, stop
+}
+
+// takeSandboxIfIdle detaches the session's sandbox and renew cancel func
+// for release when no turn is running and the session has been inactive
+// for at least d; it returns nil otherwise. Checking and detaching in a
+// single critical section closes the race with startTurn/ensureSandbox:
+// a turn that won the lock first can never lose its sandbox to the
+// reaper.
+func (s *Session) takeSandboxIfIdle(d time.Duration) (*ironhive.Sandbox, context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnID != "" || time.Since(s.lastActivity) < d {
+		return nil, nil
+	}
+	sb, stop := s.Sandbox, s.stopRenew
+	s.Sandbox = nil
+	s.stopRenew = nil
+	return sb, stop
+}
+
+// closeSession marks the session torn down (DELETE, shutdown) and
+// detaches its sandbox and renew cancel func for release. After
+// closeSession, setSandbox refuses to attach a new sandbox, so a
+// concurrently rebuilding ensureSandbox cannot leak one.
+func (s *Session) closeSession() (*ironhive.Sandbox, context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	sb, stop := s.Sandbox, s.stopRenew
+	s.Sandbox = nil
+	s.stopRenew = nil
+	return sb, stop
+}
+
+// getLoop returns the session's agent loop.
+func (s *Session) getLoop() *agent.Loop {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loop
+}
+
+// setLoop installs the agent loop built alongside a fresh sandbox.
+func (s *Session) setLoop(l *agent.Loop) {
+	s.mu.Lock()
+	s.loop = l
+	s.mu.Unlock()
 }
 
 // recordPersisted records a persisted file as session state (the
@@ -133,11 +182,14 @@ func (s *Session) startTurn(turnID string, cancel context.CancelFunc) bool {
 	return true
 }
 
-// finishTurn clears the running-turn mark when a turn ends.
+// finishTurn clears the running-turn mark when a turn ends and drops
+// tool results nobody claimed: late results of this turn (or forgeries
+// with fabricated call ids) must not leak into the next turn.
 func (s *Session) finishTurn() {
 	s.mu.Lock()
 	s.turnID = ""
 	s.turnCancel = nil
+	s.pending = nil
 	s.mu.Unlock()
 }
 
@@ -151,20 +203,32 @@ func (s *Session) cancelTurn() {
 	}
 }
 
+// pendingToolResultsCap bounds tool results reported before the agent
+// loop waits for them (or never claimed because the waiter timed out).
+// Without the cap a client could grow the map forever with fabricated
+// call ids.
+const pendingToolResultsCap = 256
+
 // AddToolResult delivers an externally reported tool result, either to a
-// waiting agent loop or into the pending buffer.
-func (s *Session) AddToolResult(r ToolResultRequest) {
+// waiting agent loop or into the pending buffer. It returns an error
+// when the pending buffer is full of unclaimed results and the call id
+// is unknown.
+func (s *Session) AddToolResult(r ToolResultRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ch, ok := s.waiters[r.CallID]; ok {
 		delete(s.waiters, r.CallID)
 		ch <- r
-		return
+		return nil
+	}
+	if _, ok := s.pending[r.CallID]; !ok && len(s.pending) >= pendingToolResultsCap {
+		return fmt.Errorf("too many pending tool results")
 	}
 	if s.pending == nil {
 		s.pending = make(map[string]ToolResultRequest)
 	}
 	s.pending[r.CallID] = r
+	return nil
 }
 
 // WaitToolResult implements agent.ToolResultWaiter: it blocks until the

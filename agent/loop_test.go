@@ -390,7 +390,8 @@ func TestLoopBusy(t *testing.T) {
 
 func TestLoopMaxSteps(t *testing.T) {
 	fs := &fakeStream{}
-	l := newTestLoop(LoopConfig{ModelName: "test-model"}, fs)
+	hist := &fakeHistory{}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist}, fs)
 	// Always answer with a tool call; the unknown tool keeps each step
 	// cheap (error text fed back).
 	l.stream = func(ctx context.Context, req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error) {
@@ -412,6 +413,12 @@ func TestLoopMaxSteps(t *testing.T) {
 	}
 	if len(fs.requests) != maxTurnSteps {
 		t.Fatalf("expected %d steps, got %d", maxTurnSteps, len(fs.requests))
+	}
+	// Like any failed turn, the {user, assistant-partial} pair is
+	// persisted.
+	saved := hist.lastSaved()
+	if len(saved) != 2 || saved[0].Role != "user" || saved[1].Role != "assistant" {
+		t.Fatalf("expected {user, assistant} pair persisted, got %+v", saved)
 	}
 }
 
@@ -609,5 +616,144 @@ func TestLoopPostTurnCompaction(t *testing.T) {
 	}
 	if saved[len(saved)-1].Content != "final answer with enough chars to matter" {
 		t.Fatalf("latest reply must be preserved verbatim: %+v", saved[len(saved)-1])
+	}
+}
+
+// failingHistory fails every Save.
+type failingHistory struct {
+	msgs []llm.Message
+	err  error
+}
+
+func (h *failingHistory) Load(context.Context) ([]llm.Message, error) {
+	return append([]llm.Message(nil), h.msgs...), nil
+}
+
+func (h *failingHistory) Save(context.Context, []llm.Message) error { return h.err }
+
+// ctxCheckHistory records whether the context passed to Save was already
+// cancelled.
+type ctxCheckHistory struct {
+	saved        [][]llm.Message
+	ctxCancelled bool
+}
+
+func (h *ctxCheckHistory) Load(context.Context) ([]llm.Message, error) { return nil, nil }
+
+func (h *ctxCheckHistory) Save(ctx context.Context, msgs []llm.Message) error {
+	h.ctxCancelled = ctx.Err() != nil
+	h.saved = append(h.saved, msgs)
+	return nil
+}
+
+func TestLoopFailTurnSavesWithCancelledContext(t *testing.T) {
+	fs := &fakeStream{}
+	fs.push(func(req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error) {
+		if onEvent != nil {
+			onEvent(llm.Event{Type: llm.EventDelta, Text: "partial"})
+		}
+		return llm.Message{}, llm.Usage{}, context.Canceled
+	})
+	hist := &ctxCheckHistory{}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist}, fs)
+
+	// The turn context is already cancelled (session deleted, controller
+	// closing, turn timeout): the partial reply must still be persisted.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &fakeReporter{}
+	err := l.RunTurn(ctx, "go", r)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if hist.ctxCancelled {
+		t.Fatalf("saveHistory used the cancelled turn context")
+	}
+	if len(hist.saved) != 1 {
+		t.Fatalf("expected history saved, got %d saves", len(hist.saved))
+	}
+	saved := hist.saved[0]
+	if len(saved) != 2 || saved[0].Role != "user" || saved[1].Role != "assistant" || saved[1].Content != "partial" {
+		t.Fatalf("expected partial pair persisted, got %+v", saved)
+	}
+}
+
+func TestLoopSaveFailureStillReportsDone(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("hi")
+	hist := &failingHistory{err: errors.New("s3 down")}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist}, fs)
+
+	r := &fakeReporter{}
+	err := l.RunTurn(context.Background(), "go", r)
+	// The save error is returned for the caller to log, but the turn
+	// succeeded: Done was reported and no Error was sent.
+	if err == nil || !strings.Contains(err.Error(), "s3 down") {
+		t.Fatalf("expected the save error returned, got %v", err)
+	}
+	if !r.doneCalled || r.doneText != "hi" {
+		t.Fatalf("expected Done(hi) before the save, got %+v", r)
+	}
+	if r.errCalled {
+		t.Fatalf("save failure must not be reported as a turn error: %s", r.errText)
+	}
+	// The in-memory history is authoritative.
+	if msgs := l.Messages(); len(msgs) != 2 {
+		t.Fatalf("expected in-memory history updated, got %+v", msgs)
+	}
+}
+
+func TestLoopPreTurnTrimSaveFailureContinues(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("ok")
+	// History needing a pre-turn trim, with a failing store.
+	hist := &failingHistory{msgs: pairs(4, "x"), err: errors.New("s3 down")}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist, MaxContext: 150}, fs)
+
+	r := &fakeReporter{}
+	err := l.RunTurn(context.Background(), "hi", r)
+	// The failed trim save did not abort the turn; only the final save
+	// error surfaces as the return value.
+	if !r.doneCalled || r.doneText != "ok" {
+		t.Fatalf("expected the turn to complete despite the failed trim save, got %+v", r)
+	}
+	if r.errCalled {
+		t.Fatalf("save failures must not be reported as turn errors: %s", r.errText)
+	}
+	if err == nil || !strings.Contains(err.Error(), "s3 down") {
+		t.Fatalf("expected the final save error returned, got %v", err)
+	}
+}
+
+func TestLoopToolErrorTruncated(t *testing.T) {
+	fs := &fakeStream{}
+	fs.toolCallReply(llm.ToolCall{ID: "c1", Name: "boom", Arguments: json.RawMessage(`{}`)})
+	fs.textReply("recovered")
+	waiter := &fakeWaiter{errs: map[string]string{"c1": strings.Repeat("x", 64*1024)}}
+	l := newTestLoop(LoopConfig{
+		ModelName:     "test-model",
+		ExternalTools: []ExternalToolSpec{{Name: "boom", Parameters: map[string]any{}}},
+		Waiter:        waiter,
+	}, fs)
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "go", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	req := fs.lastRequest()
+	var toolMsg *llm.Message
+	for i := range req.Messages {
+		if req.Messages[i].Role == "tool" {
+			toolMsg = &req.Messages[i]
+		}
+	}
+	if toolMsg == nil {
+		t.Fatalf("no tool message in %+v", req.Messages)
+	}
+	if len(toolMsg.Content) > StrictMaxBytes+4096 {
+		t.Fatalf("tool error text not bounded: %d bytes", len(toolMsg.Content))
+	}
+	if !strings.Contains(toolMsg.Content, "truncated...") {
+		t.Fatalf("expected truncation notice, got (tail) %q", toolMsg.Content[len(toolMsg.Content)-300:])
 	}
 }

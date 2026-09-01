@@ -36,6 +36,9 @@ type Registry struct {
 	advertise string
 	ttl       time.Duration
 
+	done      chan struct{}
+	closeOnce sync.Once
+
 	mu      sync.Mutex
 	leaseID clientv3.LeaseID
 }
@@ -49,6 +52,7 @@ func New(client *clientv3.Client, prefix, nodeID, advertise string, ttl time.Dur
 		nodeID:    nodeID,
 		advertise: advertise,
 		ttl:       ttl,
+		done:      make(chan struct{}),
 	}
 }
 
@@ -82,11 +86,42 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 		return fmt.Errorf("start lease keepalive: %w", err)
 	}
 	go func() {
-		for ka := range keepAliveCh {
-			if ka == nil {
-				log.Printf("registry: lease keepalive channel closed, node record will expire")
+		for range keepAliveCh {
+		}
+		// The keepalive channel only closes early when the etcd client has
+		// given up on the lease (e.g. after a network partition): the node
+		// record expires and every RegisterSession would fail with "lease
+		// not found" from here on. Re-register with backoff until success
+		// or shutdown. Note that session ownership records bound to the
+		// lost lease are NOT restored by this recovery; sessions created
+		// while the node was unregistered stay unregistered (their owner
+		// lookup fails open until the session ends).
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("registry: lease keepalive channel closed, re-registering node")
+		backoff := time.Second
+		for {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
 				return
+			case <-r.done:
+				timer.Stop()
+				return
+			case <-timer.C:
 			}
+			if err := r.RegisterNode(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("registry: re-register node: %v (retrying in %s)", err, backoff)
+				backoff = min(backoff*2, 30*time.Second)
+				continue
+			}
+			log.Printf("registry: node re-registered")
+			return
 		}
 	}()
 
@@ -97,8 +132,9 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 }
 
 // Close revokes the node lease, immediately deleting the node record and
-// every session record owned by this node.
+// every session record owned by this node, and stops keepalive recovery.
 func (r *Registry) Close(ctx context.Context) error {
+	r.closeOnce.Do(func() { close(r.done) })
 	r.mu.Lock()
 	leaseID := r.leaseID
 	r.mu.Unlock()
@@ -108,6 +144,9 @@ func (r *Registry) Close(ctx context.Context) error {
 	if _, err := r.client.Revoke(ctx, leaseID); err != nil {
 		return fmt.Errorf("revoke lease: %w", err)
 	}
+	r.mu.Lock()
+	r.leaseID = 0
+	r.mu.Unlock()
 	return nil
 }
 

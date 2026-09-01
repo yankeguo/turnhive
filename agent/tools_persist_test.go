@@ -96,6 +96,34 @@ func TestSandboxPersist(t *testing.T) {
 	}
 }
 
+func TestSandboxPersistRecordsCleanedPath(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	st := newSandboxTools(sb)
+	tools := st.list(false)
+
+	if _, err := callTool(t, tools, "write", `{"file_path": "data.txt", "content": "v"}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	store := newFakePersistStore(t)
+	var recorded []PersistedObject
+	tool := sandboxPersist{
+		t:           st,
+		store:       store,
+		sessionID:   "sess-test",
+		onPersisted: func(o PersistedObject) { recorded = append(recorded, o) },
+	}
+
+	// "./data.txt" and "data.txt" are the same file; the recorded path
+	// must be the cleaned one so session records dedupe by path.
+	if _, err := tool.Execute(context.Background(), "c1", json.RawMessage(`{"file_path": "./data.txt"}`)); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if len(recorded) != 1 || recorded[0].Path != "data.txt" {
+		t.Fatalf("expected cleaned path recorded, got %+v", recorded)
+	}
+}
+
 func TestLoopPersistRegistered(t *testing.T) {
 	sb, _ := newFakeIronhive(t)
 	fs := &fakeStream{}

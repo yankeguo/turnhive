@@ -19,7 +19,7 @@ const (
 	// DefaultMaxBytes is the default maximum number of UTF-8 bytes kept.
 	DefaultMaxBytes = 50 * 1024
 	// DefaultHint is appended to truncated output when no hint is given.
-	DefaultHint = "Output was truncated to fit within context limits. Use grep to search specific content, or read with offset/limit for specific sections."
+	DefaultHint = "Output was truncated to fit within context limits. Use grep to search specific content."
 )
 
 // Strict truncation limits for non-read tool outputs (shell, external

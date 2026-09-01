@@ -79,9 +79,12 @@ func parseUnifiedDiff(patch string) []patchFile {
 			// above walks past them.
 			continue
 		}
-		// Collect hunks until the next file header.
+		// Collect hunks until the next file header. The "+++ " lookahead
+		// matters: a removed line whose original content starts with
+		// "-- " (e.g. an SQL comment) is itself "--- "-prefixed and must
+		// not be mistaken for the next file's header.
 		var hunks []string
-		for i < len(lines) && !strings.HasPrefix(lines[i], "--- ") {
+		for i < len(lines) && !isFileHeader(lines, i) {
 			hunks = append(hunks, lines[i])
 			i++
 		}
@@ -97,6 +100,12 @@ func parseUnifiedDiff(patch string) []patchFile {
 	return files
 }
 
+// isFileHeader reports whether lines[i] starts a new file section: a
+// "--- " header immediately followed by a "+++ " header.
+func isFileHeader(lines []string, i int) bool {
+	return strings.HasPrefix(lines[i], "--- ") && i+1 < len(lines) && strings.HasPrefix(lines[i+1], "+++ ")
+}
+
 // hunkHeader matches the @@ -oldStart,oldCount +newStart,newCount @@
 // marker; only the old-side start is used, since the merged output is
 // simply emitted in order.
@@ -109,13 +118,19 @@ var hunkHeader = regexp.MustCompile(`^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))
 // verbatim. A trailing newline of existing is preserved. Context/'-'
 // mismatches return an error.
 func applyHunksToText(existing, hunkText string, isNew bool) (string, error) {
-	existingLines := strings.Split(existing, "\n")
 	// Drop the trailing empty element of a final newline so line numbers
 	// match the model's expectations (hunks address 1-based lines, no
-	// trailing empty).
-	hadTrailingNewline := len(existingLines) > 0 && existingLines[len(existingLines)-1] == ""
-	if hadTrailingNewline {
-		existingLines = existingLines[:len(existingLines)-1]
+	// trailing empty). An empty file is zero lines, not one empty line —
+	// otherwise the newline restore below would force a trailing newline
+	// onto a file that never had one.
+	var existingLines []string
+	hadTrailingNewline := false
+	if existing != "" {
+		existingLines = strings.Split(existing, "\n")
+		hadTrailingNewline = existingLines[len(existingLines)-1] == ""
+		if hadTrailingNewline {
+			existingLines = existingLines[:len(existingLines)-1]
+		}
 	}
 
 	var out []string
@@ -129,13 +144,18 @@ func applyHunksToText(existing, hunkText string, isNew bool) (string, error) {
 		if strings.HasPrefix(line, "@@") {
 			m := hunkHeader.FindStringSubmatch(line)
 			if m == nil {
-				continue
+				// A line that looks like a hunk header but does not
+				// parse must not be skipped: the +/- lines that follow
+				// would be applied against a stale cursor.
+				return "", fmt.Errorf("malformed hunk header: %s", line)
 			}
 			oldStart, _ := strconv.Atoi(m[1])
 			// Hunk addresses are 1-based: move the cursor to the line
 			// *before* the hunk's start; the hunk pushes it forward as
-			// it consumes context and '-' lines.
-			newCursor := oldStart - 1
+			// it consumes context and '-' lines. oldStart 0 (pure
+			// insertion at the head, e.g. an empty file) clamps to 0
+			// like JS slice() does with a negative index.
+			newCursor := max(oldStart-1, 0)
 			// Emit the untouched region between the previous hunk and
 			// this one verbatim, so content outside the hunks is not
 			// silently dropped. newCursor is clamped like JS slice()

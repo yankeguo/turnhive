@@ -291,3 +291,138 @@ func TestSandboxReadSelfTruncates(t *testing.T) {
 		t.Fatalf("read must not spill, spill dir exists: %v", err)
 	}
 }
+
+func TestSandboxReadDirectoryTruncates(t *testing.T) {
+	sb, f := newFakeIronhive(t)
+	tools := SandboxTools(sb)
+
+	// More entries than the generous read budget.
+	if err := os.Mkdir(f.local("many"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < DefaultMaxLines+100; i++ {
+		if err := os.WriteFile(f.local(fmt.Sprintf("many/f%05d.txt", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := callTool(t, tools, "read", `{"file_path": "many"}`)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if !strings.Contains(out, "f00000.txt") || !strings.Contains(out, "truncated...") {
+		t.Fatalf("expected truncated directory listing, got (tail) %q", out[len(out)-200:])
+	}
+}
+
+func TestSandboxReadOversizedFileCapped(t *testing.T) {
+	sb, f := newFakeIronhive(t)
+	tools := SandboxTools(sb)
+
+	// A file beyond the in-memory read cap must still return its head
+	// rather than OOM-ing or failing.
+	if err := os.WriteFile(f.local("huge.bin"), []byte(strings.Repeat("x", maxGetFileBytes+1024)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := callTool(t, tools, "read", `{"file_path": "huge.bin"}`)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(out, "read limit") || !strings.Contains(out, "truncated...") {
+		t.Fatalf("expected read-limit notice, got (tail) %q", out[len(out)-300:])
+	}
+}
+
+func TestApplyPatchNoFileSections(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	tools := SandboxTools(sb)
+
+	// Input without a single valid file section is an error, not a
+	// silent "Modified 0 files".
+	if _, err := callTool(t, tools, "apply_patch", `{"patch": "this is not a patch at all"}`); err == nil || !strings.Contains(err.Error(), "no file sections found") {
+		t.Fatalf("expected no-sections error, got %v", err)
+	}
+}
+
+func TestShellReadBackCapped(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	tools := SandboxTools(sb)
+
+	// A command whose stdout exceeds the read-back cap: the reply is
+	// cut and points at the full output file.
+	out, err := callTool(t, tools, "shell", `{"command": "head -c 5000000 /dev/zero | tr '\\0' x"}`)
+	if err != nil {
+		t.Fatalf("shell: %v", err)
+	}
+	if !strings.Contains(out, "read-back limit") || !strings.Contains(out, ".agents/shell-logs/") {
+		t.Fatalf("expected read-back cap notice, got (tail) %q", out[len(out)-300:])
+	}
+	if len(out) > maxShellReadBackBytes+4096 {
+		t.Fatalf("read-back not capped: %d bytes", len(out))
+	}
+}
+
+func TestShellEmptyEnvEventKeepsThreadedState(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	st := newSandboxTools(sb)
+	tools := st.list(false)
+
+	// Thread state with a first call (the fake reports a fixed env).
+	if _, err := callTool(t, tools, "shell", `{"command": "true"}`); err != nil {
+		t.Fatalf("shell: %v", err)
+	}
+	st.shellMu.Lock()
+	before := append([]string(nil), st.shellEnv...)
+	st.shellMu.Unlock()
+	if len(before) == 0 {
+		t.Fatal("expected threaded env after first call")
+	}
+
+	// An empty env event ("{}") unmarshals to a non-nil empty map; it
+	// must not clear the threaded environment.
+	if _, err := callTool(t, tools, "write", `{"file_path": ".agents/shell-logs/e.stdout", "content": ""}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := callTool(t, tools, "write", `{"file_path": ".agents/shell-logs/e.stderr", "content": ""}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	out, err := sandboxShell{st}.foregroundResult(context.Background(),
+		shellOutcome{exitCode: 0, env: map[string]string{}},
+		".agents/shell-logs/e.stdout", ".agents/shell-logs/e.stderr")
+	if err != nil {
+		t.Fatalf("foregroundResult: %v", err)
+	}
+	if !strings.Contains(out, "(exit code: 0)") {
+		t.Fatalf("unexpected output %q", out)
+	}
+	st.shellMu.Lock()
+	after := append([]string(nil), st.shellEnv...)
+	st.shellMu.Unlock()
+	if strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Fatalf("empty env event cleared threaded state: %v -> %v", before, after)
+	}
+}
+
+func TestShellUnknownExitCode(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	st := newSandboxTools(sb)
+	tools := st.list(false)
+
+	if _, err := callTool(t, tools, "write", `{"file_path": ".agents/shell-logs/u.stdout", "content": "partial"}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := callTool(t, tools, "write", `{"file_path": ".agents/shell-logs/u.stderr", "content": ""}`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Both the exit event and the exit file failed to parse: the reply
+	// must not lie about exit code 0.
+	out, err := sandboxShell{st}.foregroundResult(context.Background(),
+		shellOutcome{exitCode: -1},
+		".agents/shell-logs/u.stdout", ".agents/shell-logs/u.stderr")
+	if err != nil {
+		t.Fatalf("foregroundResult: %v", err)
+	}
+	if !strings.Contains(out, "(exit code: unknown)") {
+		t.Fatalf("expected unknown exit code, got %q", out)
+	}
+}

@@ -6,9 +6,12 @@
 //	cli := turnhive.NewClient("http://turnhive:8080")
 //	sess, err := cli.CreateSession(ctx, turnhive.CreateSessionRequest{ /* ... */ })
 //	defer cli.DeleteSession(ctx, sess.ID)
-//	stream, err := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
+//	turnID, err := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
+//	stream, err := cli.Events(ctx, sess.ID, 0)
+//	defer stream.Close()
 //	for event := range stream.Events() {
 //		// handle event.Type: delta / reasoning_delta / tool_call / done / error
+//		// event.TurnID == turnID identifies events of the turn just started
 //	}
 package turnhive
 
@@ -66,6 +69,10 @@ func errorFromResponse(resp *http.Response) error {
 	case http.StatusConflict:
 		return fmt.Errorf("%w: %s", ErrSessionBusy, msg)
 	case http.StatusNotFound:
+		// Wire contract with the controller (routeSession and the
+		// handlers): a 404 whose error message is exactly
+		// "session not found" maps to the sentinel. Changing the
+		// server-side message breaks this mapping.
 		if envelope.Error == "session not found" {
 			return ErrSessionNotFound
 		}
@@ -218,8 +225,8 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (st
 // Events opens the session event stream (GET .../events). Events from
 // all turns flow over it, sequenced per session; pass the last seen
 // Event.Seq as lastSeq to replay what was missed after a reconnect (0
-// replays the retained buffer). The stream must be drained (or closed)
-// to release the connection.
+// replays the retained buffer; negative values are treated as 0). The
+// stream must be drained (or closed) to release the connection.
 func (c *Client) Events(ctx context.Context, sessionID string, lastSeq int64) (*Stream, error) {
 	u := c.baseURL + "/v1/sessions/" + url.PathEscape(sessionID) + "/events"
 	if lastSeq > 0 {
@@ -302,7 +309,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return errorFromResponse(resp)
 	}
 	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		// An empty body (e.g. a future 204 endpoint) is a success, not a
+		// decode failure.
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("decode response: %w", err)
 		}
 	}

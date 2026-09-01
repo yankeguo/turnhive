@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -273,8 +274,54 @@ func TestStreamContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Fatal("Stream: expected error, got nil")
 	}
-	if err != context.Canceled {
-		t.Errorf("error = %v, want context.Canceled", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want errors.Is context.Canceled", err)
+	}
+}
+
+func TestStreamEOFWithoutDone(t *testing.T) {
+	// The connection drops mid-stream: no [DONE], no finish_reason. The
+	// partial message must not be accepted as a complete reply.
+	srv := sseServer(t, ""+
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
+
+	_, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err == nil {
+		t.Fatal("Stream: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "stream ended without [DONE]") {
+		t.Errorf("error = %q, want it to mention a missing [DONE]", err)
+	}
+}
+
+func TestStreamEOFAfterFinishReason(t *testing.T) {
+	// Endpoints that omit [DONE] but send finish_reason are tolerated.
+	srv := sseServer(t, ""+
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"+
+		"data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n")
+
+	msg, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if msg.Content != "hi" {
+		t.Errorf("Content = %q, want %q", msg.Content, "hi")
+	}
+}
+
+func TestStreamErrorChunk(t *testing.T) {
+	// Some endpoints report failures as `data: {"error": {...}}` inside a
+	// 200 SSE stream.
+	srv := sseServer(t, ""+
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"+
+		"data: {\"error\":{\"message\":\"model overloaded\",\"type\":\"server_error\"}}\n\n")
+
+	_, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err == nil {
+		t.Fatal("Stream: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "model overloaded") {
+		t.Errorf("error = %q, want it to contain the upstream error message", err)
 	}
 }
 

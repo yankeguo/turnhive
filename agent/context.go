@@ -225,7 +225,8 @@ func generateSummary(old []llm.Message, maxTokens int) string {
 	return truncateText(strings.Join(lines, "\n"), maxTokens)
 }
 
-// truncateText shortens text to roughly maxTokens, keeping the head.
+// truncateText shortens text to roughly maxTokens, keeping the head. The
+// cut never breaks a multi-byte UTF-8 character.
 func truncateText(text string, maxTokens int) string {
 	if EstimateTokens(text) <= maxTokens {
 		return text
@@ -234,5 +235,5 @@ func truncateText(text string, maxTokens int) string {
 	if len(text) <= maxChars {
 		return text
 	}
-	return text[:maxChars] + "\n\n[...content truncated for summary...]"
+	return cutToBytes(text, maxChars) + "\n\n[...content truncated for summary...]"
 }

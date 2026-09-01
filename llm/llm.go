@@ -240,7 +240,7 @@ func Stream(ctx context.Context, req Request, onEvent func(Event)) (Message, Usa
 	resp, err := http.DefaultClient.Do(hreq)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Message{}, Usage{}, ctxErr
+			return Message{}, Usage{}, fmt.Errorf("post %s: %w", req.URL, ctxErr)
 		}
 		return Message{}, Usage{}, fmt.Errorf("post %s: %w", req.URL, err)
 	}
@@ -301,6 +301,12 @@ type streamChunk struct {
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
+	// Error carries mid-stream failures some OpenAI-compatible endpoints
+	// send as `data: {"error": {...}}` inside an otherwise-200 SSE stream.
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
 }
 
 // toolCallAccumulator accumulates one streamed tool call, merging id and
@@ -312,11 +318,17 @@ type toolCallAccumulator struct {
 }
 
 // consumeStream reads the SSE stream from r until data: [DONE] or EOF.
+// EOF is only accepted as a normal end after a chunk with finish_reason
+// was seen; otherwise the connection was truncated mid-stream and the
+// accumulated message would be an incomplete reply, so an error is
+// returned instead.
 func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Message, Usage, error) {
 	var (
-		content   strings.Builder
-		toolCalls = map[int]*toolCallAccumulator{}
-		usage     Usage
+		content         strings.Builder
+		toolCalls       = map[int]*toolCallAccumulator{}
+		usage           Usage
+		sawDone         bool
+		sawFinishReason bool
 	)
 
 	reader := bufio.NewReader(r)
@@ -324,7 +336,7 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 		line, err := reader.ReadString('\n')
 		if err != nil && err != io.EOF {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return Message{}, Usage{}, ctxErr
+				return Message{}, Usage{}, fmt.Errorf("read event stream: %w", ctxErr)
 			}
 			return Message{}, Usage{}, fmt.Errorf("read event stream: %w", err)
 		}
@@ -333,11 +345,15 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 		if data, ok := strings.CutPrefix(line, "data:"); ok {
 			data = strings.TrimPrefix(data, " ")
 			if data == "[DONE]" {
+				sawDone = true
 				break
 			}
 			var chunk streamChunk
 			if jerr := json.Unmarshal([]byte(data), &chunk); jerr != nil {
 				return Message{}, Usage{}, fmt.Errorf("malformed SSE data %q: %w", truncate(data, 256), jerr)
+			}
+			if chunk.Error != nil {
+				return Message{}, Usage{}, fmt.Errorf("stream error (%s): %s", chunk.Error.Type, chunk.Error.Message)
 			}
 			if chunk.Usage != nil {
 				usage = Usage{
@@ -347,6 +363,9 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 				}
 			}
 			if len(chunk.Choices) > 0 {
+				if chunk.Choices[0].FinishReason != "" {
+					sawFinishReason = true
+				}
 				delta := chunk.Choices[0].Delta
 				if delta.Content != "" {
 					content.WriteString(delta.Content)
@@ -378,6 +397,10 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 		if err == io.EOF {
 			break
 		}
+	}
+
+	if !sawDone && !sawFinishReason {
+		return Message{}, Usage{}, fmt.Errorf("stream ended without [DONE] or finish_reason")
 	}
 
 	msg := Message{Role: "assistant", Content: content.String()}

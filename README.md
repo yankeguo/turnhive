@@ -56,9 +56,11 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 
 session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error":"session_busy"}`。
 
+所有 JSON 请求体的上限为 4MB，超限返回 400。
+
 ### session 事件流（SSE）
 
-`GET /v1/sessions/{id}/events`，响应为 `text/event-stream`。连接建立后先收到一个 `sync` 控制事件（当前进行中的 turn 与最新序号），随后是缓冲的历史事件与实时事件。每个事件带 `id: <seq>`（SSE 标准字段，按 session 单调递增）；断线后带 `?last_seq=<N>`（或 `Last-Event-ID` 头）重连即可从断点重放（服务端保留最近 2000 条事件）。
+`GET /v1/sessions/{id}/events`，响应为 `text/event-stream`。连接建立后先收到一个 `sync` 控制事件（当前进行中的 turn 与最新序号，控制帧不占事件序号、不带 `id`），随后是缓冲的历史事件与实时事件。数据事件带 `id: <seq>`（SSE 标准字段，按 session 单调递增）；断线后带 `?last_seq=<N>`（或 `Last-Event-ID` 头）重连即可从断点重放（服务端保留最近 2000 条事件）。
 
 | 事件 | 数据 | 说明 |
 | --- | --- | --- |
@@ -79,6 +81,8 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 // 或失败时：
 {"call_id": "...", "error": "错误描述"}
 ```
+
+未被等待中的工具调用匹配的回报会暂存（上限 256 条，超限返回 429），turn 结束时全部清空——turn 结束后才回报的迟到结果不会被后续 turn 消费。
 
 集群内部能力（对客户端不可见）：
 

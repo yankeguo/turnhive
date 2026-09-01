@@ -156,6 +156,69 @@ func TestApplyHunksNewFileRejectsRemoval(t *testing.T) {
 	}
 }
 
+func TestParseUnifiedDiffRemovedLineLooksLikeHeader(t *testing.T) {
+	// A removed line whose original content starts with "-- " (SQL
+	// comment style) is itself "--- "-prefixed; it must end neither the
+	// hunk nor start a phantom file section.
+	patch := `--- a/q.sql
++++ b/q.sql
+@@ -1,3 +1,2 @@
+ SELECT 1;
+--- comment
+ SELECT 2;
+--- a/other.txt
++++ b/other.txt
+@@ -1 +1 @@
+-a
++b
+`
+	files := parseUnifiedDiff(patch)
+	if len(files) != 2 || files[0].toPath != "q.sql" || files[1].toPath != "other.txt" {
+		t.Fatalf("expected q.sql and other.txt sections, got %+v", files)
+	}
+	merged, err := applyHunksToText("SELECT 1;\n-- comment\nSELECT 2;\n", files[0].hunks, false)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if merged != "SELECT 1;\nSELECT 2;\n" {
+		t.Fatalf("got %q", merged)
+	}
+}
+
+func TestApplyHunksMalformedHeader(t *testing.T) {
+	files := parseUnifiedDiff(`--- a/f.txt
++++ b/f.txt
+@@ not a header
+ a
+`)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+	_, err := applyHunksToText("a\n", files[0].hunks, false)
+	if err == nil || !strings.Contains(err.Error(), "malformed hunk header") {
+		t.Fatalf("expected malformed hunk header error, got %v", err)
+	}
+}
+
+func TestApplyHunksEmptyFileKeepsNoTrailingNewline(t *testing.T) {
+	// Patching an empty existing file must not force a trailing newline.
+	files := parseUnifiedDiff(`--- a/f.txt
++++ b/f.txt
+@@ -0,0 +1 @@
++a
+`)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(files))
+	}
+	merged, err := applyHunksToText("", files[0].hunks, false)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if merged != "a" {
+		t.Fatalf("expected no trailing newline added, got %q", merged)
+	}
+}
+
 func TestApplyHunksContentOutsideHunksPreserved(t *testing.T) {
 	existing := "head1\nhead2\na\nb\nc\ntail1\ntail2\n"
 	files := parseUnifiedDiff(`--- a/f.txt

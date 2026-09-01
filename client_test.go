@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 )
@@ -328,10 +327,75 @@ func TestReportToolError(t *testing.T) {
 	}
 }
 
-func TestEventStringContainsNoSecrets(t *testing.T) {
-	// Sanity check: Event is comparable and printable.
-	ev := Event{Type: EventToolCall, Seq: 3, TurnID: "turn-abc", ID: "c1", Name: "shell", Status: ToolCallRunning}
-	if !strings.Contains(fmt.Sprintf("%+v", ev), "shell") {
-		t.Fatal("unexpected event rendering")
+func TestEventsBadFrameIDFallsBackToPayloadSeq(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "id: notanumber\nevent: sync\ndata: {\"turn_id\":\"\",\"seq\":9}\n\n")
+	}))
+	defer done()
+
+	stream, err := cli.Events(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	ev, ok := <-stream.Events()
+	if !ok {
+		t.Fatal("stream closed without events")
+	}
+	if ev.Seq != 9 {
+		t.Fatalf("expected payload seq 9, got %d", ev.Seq)
+	}
+	for range stream.Events() {
+	}
+	if stream.Err() != nil {
+		t.Fatalf("stream error: %v", stream.Err())
+	}
+}
+
+func TestStreamCloseUnblocksProducer(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f, _ := w.(http.Flusher)
+		// Push events until the connection dies; the client below stops
+		// draining, so the run goroutine blocks on send once the buffer
+		// fills. Close must unblock it.
+		for i := 1; ; i++ {
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: delta\ndata: {\"turn_id\":\"t\",\"text\":\"x\"}\n\n", i); err != nil {
+				return
+			}
+			if f != nil {
+				f.Flush()
+			}
+		}
+	}))
+	defer done()
+
+	stream, err := cli.Events(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	// Read a few events, then abandon the stream so the buffer fills.
+	for i := 0; i < 4; i++ {
+		if _, ok := <-stream.Events(); !ok {
+			t.Fatal("stream closed early")
+		}
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-stream.Events():
+			if !ok {
+				if stream.Err() != nil {
+					t.Fatalf("stream error after Close: %v", stream.Err())
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("events channel did not close after Close")
+		}
 	}
 }

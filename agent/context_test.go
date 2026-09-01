@@ -3,6 +3,7 @@ package agent
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/yankeguo/turnhive/llm"
 )
@@ -113,5 +114,21 @@ func TestCompactMessages(t *testing.T) {
 	// The summary itself is bounded.
 	if EstimateTokens(got[0].Content) > maxSummaryTokens+200 {
 		t.Fatalf("summary exceeds budget: %d tokens", EstimateTokens(got[0].Content))
+	}
+}
+
+func TestTruncateTextMultibyteBoundary(t *testing.T) {
+	// 3-byte runes; the byte-budget cut must keep whole characters (no
+	// mojibake).
+	text := strings.Repeat("你", 100) // 300 bytes, ~75 tokens
+	got := truncateText(text, 10)    // 40-byte budget keeps 13 runes (39 bytes)
+	if !strings.HasPrefix(got, strings.Repeat("你", 13)) {
+		t.Fatalf("expected 13 whole runes kept, got %q", got[:60])
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncation broke UTF-8: %q", got[:60])
+	}
+	if !strings.HasSuffix(got, "[...content truncated for summary...]") {
+		t.Fatalf("expected truncation notice, got %q", got)
 	}
 }

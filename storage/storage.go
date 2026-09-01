@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -34,6 +35,10 @@ var ErrNotExist = errors.New("storage: object not exist")
 // defaultRegion is used when the configuration leaves Region empty, which
 // is common for S3-compatible services that ignore the region.
 const defaultRegion = "us-east-1"
+
+// maxGetObjectSize caps how much of an object GetObject buffers in
+// memory; larger objects must be fetched through a presigned URL.
+const maxGetObjectSize = 64 << 20 // 64 MiB
 
 // Store reads and writes turnhive artifacts in an S3 bucket.
 type Store struct {
@@ -70,6 +75,11 @@ func New(cfg config.S3Config) (*Store, error) {
 	}
 
 	if cfg.Endpoint != "" {
+		// The endpoint must be a bare host[:port]; the scheme comes from
+		// use_ssl. A scheme here would produce URLs like "https://http://...".
+		if strings.Contains(cfg.Endpoint, "://") {
+			return nil, fmt.Errorf("s3 endpoint %q must not include a scheme; use host:port and set use_ssl instead", cfg.Endpoint)
+		}
 		scheme := "https"
 		if !cfg.Secure() {
 			scheme = "http"
@@ -126,9 +136,14 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 	}
 	defer output.Body.Close()
 
-	body, err := io.ReadAll(output.Body)
+	// Read one byte past the cap so an oversized object is detected
+	// instead of silently truncated.
+	body, err := io.ReadAll(io.LimitReader(output.Body, maxGetObjectSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read object %q: %w", key, err)
+	}
+	if len(body) > maxGetObjectSize {
+		return nil, fmt.Errorf("read object %q: exceeds the %d byte limit; use a presigned URL instead", key, maxGetObjectSize)
 	}
 	return body, nil
 }
