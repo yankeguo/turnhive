@@ -12,12 +12,13 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 
 ## 对外 API（草案）
 
-客户端只需要两个接口：
+客户端只需要三个接口：
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /api/sessions` | 创建 session，返回 session ID |
-| `POST /api/sessions/{id}/messages` | 向 session 发送输入，流式（SSE）返回 Agent 输出 |
+| `POST /v1/sessions` | 创建 session，返回 session ID |
+| `POST /v1/sessions/{id}/messages` | 向 session 发送输入，流式（SSE）返回 Agent 输出 |
+| `DELETE /v1/sessions/{id}` | 销毁 session，释放其占用的集群资源 |
 
 集群内部能力（对客户端不可见）：
 
@@ -36,6 +37,7 @@ import "github.com/yankeguo/turnhive"
 cli := turnhive.NewClient("http://turnhive:8080")
 
 sess, _ := cli.CreateSession(ctx, turnhive.CreateSessionRequest{ /* ... */ })
+defer cli.DeleteSession(ctx, sess.ID)
 
 stream, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
 for event := range stream.Events() {
