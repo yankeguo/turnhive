@@ -77,9 +77,9 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 - 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）
 - 子 session 创建与结果汇聚（二期）
 
-## 客户端用法（规划）
+## 客户端用法
 
-根目录预留为 Go 客户端 SDK（`package turnhive`），其他项目可直接 import：
+根目录为 Go 客户端 SDK（`package turnhive`），其他项目可直接 import：
 
 ```go
 import "github.com/yankeguo/turnhive"
@@ -91,7 +91,10 @@ defer cli.DeleteSession(ctx, sess.ID)
 
 stream, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
 for event := range stream.Events() {
-    // 流式处理 Agent 输出
+    // event.Type: delta / reasoning_delta / tool_call / done / error
+    // 外部工具调用（event.Type == tool_call 且 status 为 running）执行后：
+    //   cli.ReportToolResult(ctx, sess.ID, event.ID, result)
+    //   或 cli.ReportToolError(ctx, sess.ID, event.ID, err)
 }
 ```
 
@@ -109,7 +112,7 @@ for event := range stream.Events() {
 ├── llm/             # OpenAI-compatible 流式 chat completions 客户端
 ├── registry/        # 基于 etcd 的节点发现、存活与 session 归属
 ├── storage/         # S3 封装（历史 JSONL、skill tar presign）
-└── (根目录)          # 预留给 Go 客户端 SDK
+└── (根目录)          # Go 客户端 SDK（package turnhive）
 ```
 
 ## 快速开始
