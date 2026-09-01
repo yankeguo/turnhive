@@ -23,7 +23,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	log.Printf("config loaded: s3 bucket=%q prefix=%q", cfg.S3.Bucket, cfg.S3.Prefix)
+	log.Printf("config loaded: s3 bucket=%q prefix=%q, etcd endpoints=%v", cfg.S3.Bucket, cfg.S3.Prefix, cfg.Etcd.Endpoints)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

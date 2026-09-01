@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,9 +14,27 @@ import (
 // in a shared S3 bucket.
 const DefaultPrefix = "turnhive"
 
+// DefaultEtcdDialTimeout is the default timeout for establishing a
+// connection to an etcd endpoint.
+const DefaultEtcdDialTimeout = 5 * time.Second
+
+// Duration is a time.Duration that unmarshals from YAML strings like "5s".
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	v, err := time.ParseDuration(value.Value)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", value.Value, err)
+	}
+	*d = Duration(v)
+	return nil
+}
+
 // Config is the root of the turnhive configuration file.
 type Config struct {
-	S3 S3Config `yaml:"s3"`
+	S3   S3Config   `yaml:"s3"`
+	Etcd EtcdConfig `yaml:"etcd"`
 }
 
 // S3Config holds S3-compatible object storage settings. The fields follow
@@ -49,6 +68,34 @@ func (c S3Config) Secure() bool {
 	return c.UseSSL == nil || *c.UseSSL
 }
 
+// EtcdConfig holds etcd client connection settings following the
+// recommendations of the official etcd clientv3 package.
+type EtcdConfig struct {
+	// Endpoints is the list of etcd server addresses,
+	// e.g. ["https://127.0.0.1:2379"]. At least one is required.
+	Endpoints []string `yaml:"endpoints"`
+	// DialTimeout is the timeout for establishing a connection to an
+	// endpoint. Defaults to 5s.
+	DialTimeout Duration `yaml:"dial_timeout"`
+	// Username and Password enable etcd authentication. Leave both empty
+	// for clusters without auth.
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	// TLS holds client certificate settings. Leave empty for plaintext
+	// endpoints.
+	TLS TLSConfig `yaml:"tls"`
+}
+
+// TLSConfig holds the file paths needed to build a TLS transport.
+type TLSConfig struct {
+	// CertFile and KeyFile are the client certificate pair; they must be
+	// set together.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// CAFile is the trusted CA bundle used to verify the server.
+	CAFile string `yaml:"ca_file"`
+}
+
 // Load reads and validates the configuration file at path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -72,6 +119,9 @@ func (c *Config) setDefaults() {
 	if c.S3.Prefix == "" {
 		c.S3.Prefix = DefaultPrefix
 	}
+	if c.Etcd.DialTimeout == 0 {
+		c.Etcd.DialTimeout = Duration(DefaultEtcdDialTimeout)
+	}
 }
 
 func (c *Config) validate() error {
@@ -81,6 +131,12 @@ func (c *Config) validate() error {
 	c.S3.Prefix = strings.Trim(c.S3.Prefix, "/")
 	if strings.Contains(c.S3.Prefix, "//") {
 		return fmt.Errorf("s3.prefix must not contain consecutive slashes")
+	}
+	if len(c.Etcd.Endpoints) == 0 {
+		return fmt.Errorf("etcd.endpoints is required")
+	}
+	if (c.Etcd.TLS.CertFile == "") != (c.Etcd.TLS.KeyFile == "") {
+		return fmt.Errorf("etcd.tls.cert_file and etcd.tls.key_file must be set together")
 	}
 	return nil
 }

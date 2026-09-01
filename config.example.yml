@@ -16,3 +16,20 @@ s3:
   force_path_style: false
   # Object key prefix, allows sharing one bucket across projects.
   prefix: turnhive
+
+etcd:
+  # At least one endpoint is required; list all cluster members for
+  # automatic failover.
+  endpoints:
+    - "http://127.0.0.1:2379"
+  # Timeout for establishing a connection to an endpoint.
+  dial_timeout: 5s
+  # Leave empty for clusters without auth enabled.
+  username: ""
+  password: ""
+  # Leave empty for plaintext endpoints.
+  tls:
+    # cert_file and key_file must be set together.
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
