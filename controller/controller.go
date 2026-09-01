@@ -224,6 +224,7 @@ func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.
 		ExternalTools: externalTools,
 		Waiter:        sess,
 		History:       agent.S3History(c.store, sess.ID),
+		MaxContext:    req.Model.MaxContext,
 	})
 }
 

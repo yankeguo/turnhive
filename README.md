@@ -33,7 +33,7 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
     "protocol": "openai_completions",                     // 当前固定
     "name": "my-model",
     "headers": {"Authorization": "Bearer ..."},           // 认证头和其他额外头
-    "max_context": 131072,                                // 可选；模型上下文窗口（tokens）
+    "max_context": 131072,                                // 可选；模型上下文窗口（tokens），驱动上下文窗口管理
     "features": ["support_image"]                            // 可选；能力标记，当前仅 support_image
   },
   "prompt": {"system": "you are an agent"},               // 系统提示词
@@ -84,6 +84,7 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 
 - 大模型调用（OpenAI-compatible 流式端点）
 - 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）；persist（把沙盒文件转存到 S3 `sessions/{id}/persisted/` 并记录为 session 属性，随 sync 帧下发）
+- 上下文窗口管理（`model.max_context` 驱动）：每个 turn 前按估算整轮丢弃最旧历史（保留最近 turn 与回复预算），turn 用量超 0.8×窗口后把旧 turn 压缩为结构化 `<context-summary>` 摘要（保留最近 2 轮原文）
 - session 无限恢复：沙盒空闲超 `session.idle_timeout` 被回收但 session 不销毁；下一条消息时自动重建沙盒（重装 skills、回灌 persisted 文件、从 S3 重载历史），会话无缝继续
 - 子 session 创建与结果汇聚（二期）
 

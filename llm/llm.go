@@ -44,10 +44,10 @@ type Message struct {
 // present; tool call arguments are strings holding the JSON document,
 // per the OpenAI function calling convention.
 type messageWire struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content"`
-	ToolCalls  []toolCallWire  `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role       string         `json:"role"`
+	Content    any            `json:"content"`
+	ToolCalls  []toolCallWire `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
 // contentPart is one part of a multipart message content array.

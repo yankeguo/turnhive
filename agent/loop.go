@@ -56,6 +56,11 @@ type LoopConfig struct {
 	// History persists the message history; nil keeps history in memory
 	// only.
 	History HistoryStore
+	// MaxContext is the model's context window in tokens; zero disables
+	// context window management. When set, the history is trimmed before
+	// every turn (TruncateToFit) and compacted after a turn whose usage
+	// crosses the overflow threshold (CompactMessages).
+	MaxContext int
 }
 
 // Loop runs agent turns against one model endpoint: it streams chat
@@ -111,6 +116,22 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 
 	userMsg := llm.Message{Role: "user", Content: userText}
 
+	// Pre-turn context window management: drop the oldest whole turns
+	// when the estimated history no longer fits the window (the incoming
+	// user message is appended afterwards and never dropped).
+	if l.cfg.MaxContext > 0 {
+		l.mu.Lock()
+		trimmed, changed := TruncateToFit(l.history, l.cfg.MaxContext, replyReserve+EstimateTokens(l.cfg.SystemPrompt))
+		l.history = trimmed
+		l.mu.Unlock()
+		if changed {
+			if err := l.saveHistory(ctx); err != nil {
+				r.Error(err.Error())
+				return err
+			}
+		}
+	}
+
 	// The request messages are [system] + history + the user message +
 	// the transient tool exchanges of this turn.
 	l.mu.Lock()
@@ -124,7 +145,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 
 	for step := 0; step < maxTurnSteps; step++ {
 		var stepText strings.Builder
-		msg, _, err := l.stream(ctx, llm.Request{
+		msg, usage, err := l.stream(ctx, llm.Request{
 			URL:      l.cfg.ModelURL,
 			Headers:  l.cfg.ModelHeaders,
 			Model:    l.cfg.ModelName,
@@ -148,6 +169,13 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 			// carries the {user, assistant} pair — the tool exchanges
 			// of this turn stay transient.
 			l.appendHistory(userMsg, llm.Message{Role: "assistant", Content: msg.Content})
+			// Post-turn compaction: a turn that pushed usage past the
+			// overflow threshold condenses older turns into a summary.
+			if l.cfg.MaxContext > 0 && IsOverflow(usage, l.cfg.MaxContext) {
+				l.mu.Lock()
+				l.history = CompactMessages(l.history)
+				l.mu.Unlock()
+			}
 			if err := l.saveHistory(ctx); err != nil {
 				r.Error(err.Error())
 				return err

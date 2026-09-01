@@ -52,12 +52,12 @@ type Event struct {
 	Type    EventType
 	Seq     int64
 	TurnID  string
-	Text    string        // delta, reasoning_delta, done
-	ID      string        // tool_call
-	Name    string        // tool_call
-	Title   string        // tool_call, optional
-	Status  string        // tool_call: ToolCallRunning / ToolCallDone / ToolCallError
-	Message string        // error
+	Text    string // delta, reasoning_delta, done
+	ID      string // tool_call
+	Name    string // tool_call
+	Title   string // tool_call, optional
+	Status  string // tool_call: ToolCallRunning / ToolCallDone / ToolCallError
+	Message string // error
 	// Messages is the full merged history carried by the sync event
 	// (completed turns as {user, assistant} pairs); empty for all other
 	// event types.
@@ -176,16 +176,16 @@ func (s *Stream) run() {
 			seq = p.Seq
 		}
 		s.events <- Event{
-			Type:    EventType(name),
-			Seq:     seq,
-			TurnID:  p.TurnID,
-			Text:    p.Text,
-			ID:      p.ID,
-			Name:    p.Name,
-			Title:   p.Title,
-			Status:  p.Status,
-			Message: p.Message,
-			Messages: p.Messages,
+			Type:      EventType(name),
+			Seq:       seq,
+			TurnID:    p.TurnID,
+			Text:      p.Text,
+			ID:        p.ID,
+			Name:      p.Name,
+			Title:     p.Title,
+			Status:    p.Status,
+			Message:   p.Message,
+			Messages:  p.Messages,
 			Persisted: p.Persisted,
 		}
 		return true

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -68,11 +69,16 @@ func (f *fakeStream) push(fn streamFunc) {
 
 // textReply queues a plain assistant text reply.
 func (f *fakeStream) textReply(text string) {
+	f.textReplyUsage(text, llm.Usage{})
+}
+
+// textReplyUsage queues a plain assistant text reply with usage.
+func (f *fakeStream) textReplyUsage(text string, usage llm.Usage) {
 	f.push(func(req llm.Request, onEvent func(llm.Event)) (llm.Message, llm.Usage, error) {
 		if onEvent != nil {
 			onEvent(llm.Event{Type: llm.EventDelta, Text: text})
 		}
-		return llm.Message{Role: "assistant", Content: text}, llm.Usage{}, nil
+		return llm.Message{Role: "assistant", Content: text}, usage, nil
 	})
 }
 
@@ -535,5 +541,73 @@ func TestLoopShellToolSpill(t *testing.T) {
 	}
 	if !strings.Contains(string(full), "5000") {
 		t.Fatalf("spill file incomplete: %d bytes", len(full))
+	}
+}
+
+func TestLoopPreTurnTrim(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("ok")
+	// Long history: 4 distinct pairs, each ~200 chars.
+	var msgs []llm.Message
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs,
+			llm.Message{Role: "user", Content: fmt.Sprintf("user-%d ", i) + strings.Repeat("u", 200)},
+			llm.Message{Role: "assistant", Content: fmt.Sprintf("assistant-%d ", i) + strings.Repeat("a", 200)})
+	}
+	hist := &fakeHistory{msgs: msgs}
+	// Absurd budget (reserve dwarfs the window): only the last old turn
+	// may survive — the user's most recent message is never dropped.
+	l := newTestLoop(LoopConfig{ModelName: "m", History: hist, MaxContext: 150}, fs)
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "hi", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	// The request must contain only the last old turn, not the older ones.
+	req := fs.lastRequest()
+	var requestUsers []string
+	for _, m := range req.Messages {
+		if m.Role == "user" {
+			requestUsers = append(requestUsers, m.Content)
+		}
+	}
+	if len(requestUsers) != 2 || !strings.HasPrefix(requestUsers[0], "user-3 ") {
+		t.Fatalf("expected only user-3 plus the new message, got %v", requestUsers)
+	}
+	// Saved history is the last old pair plus the new one.
+	saved := hist.lastSaved()
+	if len(saved) != 4 || !strings.HasPrefix(saved[0].Content, "user-3 ") {
+		t.Fatalf("unexpected saved history: %d messages, first %q", len(saved), saved[0].Content[:20])
+	}
+}
+
+func TestLoopPostTurnCompaction(t *testing.T) {
+	fs := &fakeStream{}
+	// MaxContext=20000: pre-turn budget (12000) fits the small history,
+	// usage 17050 crosses the 0.8 overflow threshold (16000).
+	fs.textReplyUsage("final answer with enough chars to matter", llm.Usage{PromptTokens: 16850, CompletionTokens: 200})
+	var msgs []llm.Message
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs,
+			llm.Message{Role: "user", Content: "question with a fair amount of text in it"},
+			llm.Message{Role: "assistant", Content: "answer with a fair amount of text in it"})
+	}
+	hist := &fakeHistory{msgs: msgs}
+	l := newTestLoop(LoopConfig{ModelName: "m", History: hist, MaxContext: 20000}, fs)
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "wrap up", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	saved := hist.lastSaved()
+	// Compacted: summary + last 2 turns (one old pair + the new pair).
+	if len(saved) != 5 {
+		t.Fatalf("expected summary + 4 messages, got %d", len(saved))
+	}
+	if saved[0].Role != "user" || !strings.HasPrefix(saved[0].Content, "<context-summary>") {
+		t.Fatalf("history must start with the context summary: %+v", saved[0])
+	}
+	if saved[len(saved)-1].Content != "final answer with enough chars to matter" {
+		t.Fatalf("latest reply must be preserved verbatim: %+v", saved[len(saved)-1])
 	}
 }

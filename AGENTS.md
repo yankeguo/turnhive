@@ -56,6 +56,7 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 - 沙盒租约在 session 存活期间由 controller 按 lease/2 间隔自动续约；DELETE session 和优雅关闭（`Controller.Close`）都会先取消运行中的 turn、停止续约并释放沙盒——新增 session 生命周期路径时必须维护这两条清理路径。
 - 跨节点路由靠 etcd 归属记录 + `X-Turnhive-Forwarded` 头防转发循环；已转发的请求绝不二次转发。
 - LLM 历史只持久化 {user, assistant} 对（S3 JSONL），tool 交互是 turn 内瞬态。
+- 上下文窗口管理（`model.max_context`，0 关闭，参考 agentdesk runner 的 context.ts）：turn 前 `TruncateToFit` 按 chars/4 估算整轮丢弃最旧历史（预算 = max_context − 8000 回复预留 − system 估算；预算再小也保留最后一个完整 turn）；turn 后该 turn 的 usage 超 0.8×窗口时 `CompactMessages` 把最近 2 轮之前的历史压成结构化 `<context-summary>` user 消息（确定性文本摘要，不调 LLM），并回写 S3 历史。
 - 沙箱路径一律相对（不假设 WORKDIR），`..` 逃逸词法拒绝；skills 安装在 `./.agents/skills/<name>/`，该树对 write/edit/apply_patch 只读。绝对路径直接透传（沙盒是一次性的）。
 - shell 是有状态的：ironhive 每次调用经 cwd/env 事件上报执行后的工作目录与全量环境，turnhive 在下一次前台调用回传（`strict_env`），因此 `cd`/`export` 在 session 内跨调用保持（仅前台完成的调用更新状态）。
 - shell 输出从启动即重定向到沙盒 `.agents/shell-logs/<callID>.{stdout,stderr,exit}`（真实退出码在 .exit 文件，SSE exit 事件只是兜底）：前台调用完成后读回，字节精确；30s 前台窗口到期或 `bg: true` 时不杀进程转后台，回报 pid（ironhive pid 事件，即 pgid）+ 输出文件路径，模型用 `tail/cat` 轮询、`kill -- -<pid>` 杀整组。后台进程不回传状态，随沙盒销毁。
