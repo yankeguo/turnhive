@@ -31,8 +31,9 @@ go.work.sum
 config.yml
 .tmp/
 
-# local reference projects (deliberately untracked)
+# local reference projects and local agent docs (deliberately untracked)
 refs/
+AGENTS.local.md
 
 # Editor/IDE
 # .idea/

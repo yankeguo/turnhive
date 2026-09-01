@@ -27,7 +27,7 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 └── storage/         # S3 封装（历史 JSONL、skill tar presign）
 ```
 
-另外有 `refs/` 目录存放参考项目副本，刻意不被 git 追踪（已在 .gitignore 中忽略）；需要参考信息时先读 `refs/REFS.md`，了解其中有哪些参考项目及其用途。
+另外有 `refs/` 目录存放参考项目副本，刻意不被 git 追踪（已在 .gitignore 中忽略）；参考项目说明及与 agentdesk-runner 的功能对比记录见 `AGENTS.local.md`（同样不被 git 追踪的本地文档），需要参考信息时先读它。
 
 ## 代码约定
 
@@ -63,5 +63,6 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 - shell 输出从启动即重定向到沙盒 `.agents/shell-logs/<callID>.{stdout,stderr,exit}`（真实退出码在 .exit 文件，SSE exit 事件只是兜底）：前台调用完成后读回，字节精确；30s 前台窗口到期或 `bg: true` 时不杀进程转后台，回报 pid（ironhive pid 事件，即 pgid）+ 输出文件路径，模型用 `tail/cat` 轮询、`kill -- -<pid>` 杀整组。后台进程不回传状态，随沙盒销毁。
 - 工具输出分两级截断（参考 agentdesk runner）：`read` 自带 2000 行/50KB 预算自行截断（目录 listing 同样过该预算；文件读取本身有 8MB 内存上限）；其他工具（含工具错误文本）走更严格的 500 行/16KB，超限完整输出由 `OutputSpiller` 写入沙盒 `./.agents/tool-results/<tool>-NNNN.txt`，模型只收到 head 预览 + 文件路径 + 读取提示（spill 失败退化为普通截断）。shell 前台结果读回有 4MB 内存上限，超限提示模型去 `.agents/shell-logs/` 查完整文件。
 - `load_media` 仅在 `model.features` 含 `support_image` 时挂载（`ImageTool.ExecuteImage` 返回 data URI）；图片紧跟其 tool 消息以 user 消息（image_url parts）注入下一轮请求——chat completions 只在 user 消息接受图片；图片是瞬态的，不入历史。
+- MCP（`agent/tools_mcp.go`，官方 go-sdk，仅 SSE / Streamable HTTP，不支持 stdio）：**每 turn 现场连接**——`RunTurn` 开始时装载、turn 结束 `closeAll` 断开，不占用 session 清理路径；工具名 `{server}__{tool}` 命名空间（server name 校验 `^[a-zA-Z0-9_-]{1,32}$` 且唯一；namespaced 名违反 OpenAI 函数名约束或与既有工具重名的直接跳过）；`transport` 缺省 auto（先 streamable 后回退 legacy SSE，**仅 connect 失败才回退**，list 失败不回退）；单 server 连接/list 失败只经 `OnMCPStatus` 记日志，不拖垮其他 server 与 turn。**坑**：legacy SSE transport 的挂起 GET 绑在 connect ctx 上，所以连接用独立 `sessCtx`（turn ctx 派生、closeAll 时取消），10s 建立上限靠与 timer 竞速实现，不能给 connect ctx 直接套 timeout/defer cancel；streamable 设 `DisableStandaloneSSE`（turn 级短连接不需要 server 推送通道）。MCP 工具输出走通用 `TruncateSpill`（500 行/16KB + spill），`IsError` 结果转成 Go error 回填。
 - `persist` 工具把沙盒文件上传到 S3 `sessions/{id}/persisted/<path>`（同路径重复 persist 原地覆盖），并把 `PersistedObject{path, object_key, size, at}` 记录为 **session 字段**（按 path 去重），随事件流 `sync` 帧下发——不是一次工具调用的旁注；object_key 相对 store prefix（与 SkillSpec.ObjectKey 同约定）。persist 不只面向最终产物，关键中间产物也应 persist——它是 session 恢复的物质基础。**双向传输都走 presigned URL 由沙盒直连 S3**：上传用 `PresignPut` + `/agent/v1/file/upload`（PUT），下载/恢复用 `PresignGet` + `/agent/v1/{file,tar}?url=`，turnhive 不中转字节。
 - session 与沙盒解耦（无限恢复）：sweeper 按 `session.idle_timeout` 回收无 turn 活动 session 的沙盒（session/hub/历史保留），idle 判定与沙盒 detach 在单次锁临界区内完成（`takeSandboxIfIdle`，与 startTurn 互斥）；下一条消息经 `ensureSandbox` 重建——分配新沙盒 → 重装 skills → `RestorePersisted` 回灌文件 → 重建 Loop 并 `LoadHistory`（历史本就在 S3）→ 重启续约；session 关闭（DELETE / `Controller.Close`）会置 `closed` 标志，`setSandbox` 对已关闭 session 拒绝并立即释放新建沙盒与续约 goroutine（防孤儿泄漏）。**沙盒文件注入一律走 S3 presigned URL 由沙盒自拉取**（skills tar 用 `/agent/v1/tar?url=`、persisted 文件用 `/agent/v1/file?url=`），turnhive 不中转字节。改动 session 生命周期时必须维护这条重建链路与两条清理路径（DELETE / `Controller.Close`）。
