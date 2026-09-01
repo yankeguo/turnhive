@@ -156,8 +156,38 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
 		return
 	}
+	// Keep the sandbox lease alive for as long as the session lives;
+	// without renewal ironhive destroys the sandbox when the lease
+	// granted at allocation time expires.
+	renewCtx, stopRenew := context.WithCancel(context.Background())
+	sess.stopRenew = stopRenew
+	go c.renewSandbox(renewCtx, sandbox)
 	c.sessions.Store(id, sess)
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// renewSandbox renews the sandbox lease at half-lease intervals until ctx
+// is cancelled (session deleted or node shutdown). Failures are only
+// logged: the turn that next touches a dead sandbox reports the error.
+func (c *Controller) renewSandbox(ctx context.Context, sb *ironhive.Sandbox) {
+	interval := c.sandboxLease / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
+			if err := sb.Renew(renewCtx, c.sandboxLease); err != nil {
+				log.Printf("renew sandbox %s: %v", sb.Name, err)
+			}
+			cancel()
+		}
+	}
 }
 
 // CreateMessageRequest is the JSON body of POST /v1/sessions/{id}/messages.
@@ -184,7 +214,12 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
 		return
 	}
-	v, _ := c.sessions.Load(id)
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		// Lost a race with DELETE after routeSession.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
 	sess := v.(*Session)
 
 	rep := newSSEReporter(w)
@@ -223,7 +258,12 @@ func (c *Controller) handleCreateToolResult(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	v, _ := c.sessions.Load(id)
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		// Lost a race with DELETE after routeSession.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
 	v.(*Session).AddToolResult(req)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
@@ -236,8 +276,13 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	}
 	v, _ := c.sessions.Load(id)
 	c.sessions.Delete(id)
-	if sess, ok := v.(*Session); ok && sess.Sandbox != nil {
-		releaseSandbox(sess.Sandbox)
+	if sess, ok := v.(*Session); ok {
+		if sess.stopRenew != nil {
+			sess.stopRenew()
+		}
+		if sess.Sandbox != nil {
+			releaseSandbox(sess.Sandbox)
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
 	defer cancel()
@@ -245,6 +290,25 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		log.Printf("unregister session %s: %v", id, err)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Close tears down every session owned by this node: it stops the lease
+// renewal loops and releases the sandboxes. It is called during graceful
+// shutdown, after the HTTP server has stopped, so no handler is still
+// touching the sessions map.
+func (c *Controller) Close() {
+	c.sessions.Range(func(key, v any) bool {
+		c.sessions.Delete(key)
+		if sess, ok := v.(*Session); ok {
+			if sess.stopRenew != nil {
+				sess.stopRenew()
+			}
+			if sess.Sandbox != nil {
+				releaseSandbox(sess.Sandbox)
+			}
+		}
+		return true
+	})
 }
 
 // releaseSandbox destroys a session's sandbox on a detached context, so

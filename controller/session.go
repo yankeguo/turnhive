@@ -25,6 +25,8 @@ type Session struct {
 	Sandbox *ironhive.Sandbox
 	// Loop runs the agent turns of this session.
 	Loop *agent.Loop
+	// stopRenew cancels the sandbox lease renewal loop of this session.
+	stopRenew context.CancelFunc
 
 	mu sync.Mutex
 	// pending holds tool results that arrived before the agent loop

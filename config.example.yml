@@ -57,6 +57,7 @@ ironhive:
   # Base URL of the ironhive controller, which provides the sandboxes
   # sessions execute in. Required.
   url: "http://127.0.0.1:8080"
-  # Sandbox lease duration requested at allocation time. A sandbox whose
-  # lease expires is destroyed by ironhive. Default 30m.
+  # Sandbox lease duration requested at allocation time and renewed
+  # periodically while the session is alive. A sandbox whose lease
+  # expires is destroyed by ironhive. Default 30m.
   lease: 30m

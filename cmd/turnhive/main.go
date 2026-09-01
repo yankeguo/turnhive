@@ -52,7 +52,8 @@ func main() {
 		log.Fatalf("connect s3: %v", err)
 	}
 	ihClient := ironhive.NewClient(cfg.Ironhive.URL)
-	controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease)).RegisterRoutes(mux)
+	ctrl := controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease))
+	ctrl.RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
@@ -82,9 +83,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("graceful shutdown failed: %v", err)
 	}
+	// Release the sandboxes of every session this node owns; otherwise
+	// they leak until their ironhive lease expires.
+	ctrl.Close()
 	// Revoke the node lease so the node record and all of its session
-	// records disappear from etcd immediately.
-	if err := reg.Close(shutdownCtx); err != nil {
+	// records disappear from etcd immediately. Use a fresh context:
+	// shutdownCtx may already be expired.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer closeCancel()
+	if err := reg.Close(closeCtx); err != nil {
 		log.Printf("deregister node: %v", err)
 	}
 	log.Println("server stopped")
