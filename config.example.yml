@@ -1,0 +1,18 @@
+# turnhive configuration
+# Copy to config.yml and adjust for your environment.
+
+s3:
+  # S3-compatible service address. Leave empty for AWS default endpoints.
+  # Examples: "s3.us-east-1.amazonaws.com", "minio.example.com", "127.0.0.1:9000"
+  endpoint: ""
+  region: us-east-1
+  bucket: my-bucket
+  access_key_id: ""
+  secret_access_key: ""
+  # Set false for plain-HTTP local services (default true).
+  use_ssl: true
+  # Use path-style addressing (endpoint/bucket/key). Required by MinIO,
+  # RustFS and many on-premise S3-compatible services.
+  force_path_style: false
+  # Object key prefix, allows sharing one bucket across projects.
+  prefix: turnhive

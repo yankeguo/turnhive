@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -10,10 +11,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yankeguo/turnhive/config"
 	"github.com/yankeguo/turnhive/controller"
 )
 
 func main() {
+	configPath := flag.String("config", "config.yml", "path to the configuration file")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	log.Printf("config loaded: s3 bucket=%q prefix=%q", cfg.S3.Bucket, cfg.S3.Prefix)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
