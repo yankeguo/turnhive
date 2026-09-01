@@ -1,6 +1,18 @@
 # turnhive configuration
 # Copy to config.yml and adjust for your environment.
 
+# Address the HTTP server binds to.
+listen: ":8080"
+
+node:
+  # Unique node identity in the cluster. Leave empty to use
+  # "<hostname>-<pid>".
+  id: ""
+  # Base URL other nodes use to forward session requests to this node.
+  # Leave empty to use "http://127.0.0.1:<listen port>"; set it to an
+  # address reachable by other nodes in a real deployment.
+  advertise: ""
+
 s3:
   # S3-compatible service address. Leave empty for AWS default endpoints.
   # Examples: "s3.us-east-1.amazonaws.com", "minio.example.com", "127.0.0.1:9000"
@@ -33,3 +45,10 @@ etcd:
     cert_file: ""
     key_file: ""
     ca_file: ""
+  # Key prefix for node and session records, allows sharing one etcd
+  # across clusters.
+  prefix: turnhive
+  # TTL of the lease a node registers itself and its sessions under.
+  # A node that crashes or loses its keepalive disappears from the
+  # cluster (together with its sessions) after this duration.
+  lease_ttl: 10s

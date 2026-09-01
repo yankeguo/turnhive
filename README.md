@@ -45,11 +45,17 @@ for event := range stream.Events() {
 }
 ```
 
+## 集群发现与路由
+
+节点启动时在 etcd 注册自身（`{prefix}/nodes/{nodeID}`，挂 lease 自动 keepalive），创建 session 时把归属关系写入 `{prefix}/sessions/{sessionID}`。任何节点收到 session 相关请求时，先查本地，再查 etcd 定位 owner 节点并透明反向代理过去，客户端无感知。节点宕机后 lease 过期，其节点记录和名下 session 记录自动清除。
+
 ## 项目结构
 
 ```
 ├── cmd/turnhive/    # 服务端入口（HTTP server，优雅关闭）
-├── controller/      # HTTP 路由与业务逻辑
+├── config/          # 配置文件加载与校验
+├── controller/      # HTTP 路由与业务逻辑（含跨节点转发）
+├── registry/        # 基于 etcd 的节点发现、存活与 session 归属
 └── (根目录)          # 预留给 Go 客户端 SDK
 ```
 

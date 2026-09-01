@@ -2,43 +2,149 @@
 package controller
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/yankeguo/turnhive/registry"
 )
+
+// headerForwarded marks a request that has already been forwarded by
+// another node, preventing forwarding loops.
+const headerForwarded = "X-Turnhive-Forwarded"
+
+// lookupTimeout bounds etcd ownership lookups on the request path.
+const lookupTimeout = 5 * time.Second
+
+// Controller holds the dependencies shared by all HTTP handlers.
+type Controller struct {
+	nodeID   string
+	registry *registry.Registry
+
+	// sessions is the set of session IDs owned by this node.
+	sessions sync.Map
+	// proxies caches one reverse proxy per owner node address.
+	proxies sync.Map
+}
+
+// New creates a Controller for the given node.
+func New(nodeID string, reg *registry.Registry) *Controller {
+	return &Controller{nodeID: nodeID, registry: reg}
+}
 
 // RegisterRoutes registers all routes on the given mux using the Go 1.22+
 // method-and-pattern routing syntax.
-func RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("POST /v1/sessions", handleCreateSession)
-	mux.HandleFunc("POST /v1/sessions/{id}/messages", handleCreateMessage)
-	mux.HandleFunc("DELETE /v1/sessions/{id}", handleDeleteSession)
+func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /healthz", c.handleHealthz)
+	mux.HandleFunc("POST /v1/sessions", c.handleCreateSession)
+	mux.HandleFunc("POST /v1/sessions/{id}/messages", c.handleCreateMessage)
+	mux.HandleFunc("DELETE /v1/sessions/{id}", c.handleDeleteSession)
 }
 
-func handleHealthz(w http.ResponseWriter, r *http.Request) {
+func (c *Controller) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleCreateSession is a placeholder: it returns a random session ID
-// without allocating any real resource.
-func handleCreateSession(w http.ResponseWriter, r *http.Request) {
+// handleCreateSession creates a session owned by this node and publishes
+// its ownership record so any node in the cluster can route to it.
+func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
-	writeJSON(w, http.StatusCreated, map[string]string{"id": hex.EncodeToString(b[:])})
+	id := hex.EncodeToString(b[:])
+
+	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
+	defer cancel()
+	if err := c.registry.RegisterSession(ctx, id); err != nil {
+		log.Printf("register session %s: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
+		return
+	}
+	c.sessions.Store(id, struct{}{})
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
 // handleCreateMessage is a placeholder for the streaming (SSE) interaction
-// endpoint.
-func handleCreateMessage(w http.ResponseWriter, r *http.Request) {
+// endpoint; it only implements session routing for now.
+func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request) {
+	if !c.routeSession(w, r, r.PathValue("id")) {
+		return
+	}
 	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not implemented"})
 }
 
-// handleDeleteSession is a placeholder: it accepts any session ID and
-// releases nothing.
-func handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+// handleDeleteSession releases the session on its owner node.
+func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	c.sessions.Delete(id)
+	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
+	defer cancel()
+	if err := c.registry.UnregisterSession(ctx, id); err != nil {
+		log.Printf("unregister session %s: %v", id, err)
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// routeSession ensures the request is handled on the node that owns the
+// session. It reports whether the session is local and the caller should
+// proceed; otherwise the response has already been written (forwarded to
+// the owner node, or an error).
+func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id string) bool {
+	if _, ok := c.sessions.Load(id); ok {
+		return true
+	}
+	// Already forwarded once: the owner does not have this session,
+	// so it does not exist. Never forward a second time.
+	if r.Header.Get(headerForwarded) != "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
+	defer cancel()
+	addr, ok, err := c.registry.SessionOwner(ctx, id)
+	if err != nil {
+		log.Printf("lookup session %s owner: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to locate session"})
+		return false
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return false
+	}
+	c.proxy(addr).ServeHTTP(w, r)
+	return false
+}
+
+// proxy returns the cached reverse proxy for the given owner node address.
+func (c *Controller) proxy(addr string) *httputil.ReverseProxy {
+	if p, ok := c.proxies.Load(addr); ok {
+		return p.(*httputil.ReverseProxy)
+	}
+	target, err := url.Parse(addr)
+	if err != nil {
+		// node.advertise is validated at startup, so this cannot happen.
+		log.Fatalf("invalid node address %q: %v", addr, err)
+	}
+	p := httputil.NewSingleHostReverseProxy(target)
+	p.FlushInterval = -1 // stream responses (SSE) without buffering
+	p.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		req.Header.Set(headerForwarded, "1")
+	}
+	actual, _ := c.proxies.LoadOrStore(addr, p)
+	return actual.(*httputil.ReverseProxy)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
