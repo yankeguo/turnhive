@@ -28,7 +28,7 @@ type Controller struct {
 	nodeID   string
 	registry *registry.Registry
 
-	// sessions is the set of session IDs owned by this node.
+	// sessions holds the sessions owned by this node, keyed by session ID.
 	sessions sync.Map
 	// proxies caches one reverse proxy per owner node address.
 	proxies sync.Map
@@ -45,6 +45,7 @@ func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", c.handleHealthz)
 	mux.HandleFunc("POST /v1/sessions", c.handleCreateSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", c.handleCreateMessage)
+	mux.HandleFunc("POST /v1/sessions/{id}/tool_results", c.handleCreateToolResult)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", c.handleDeleteSession)
 }
 
@@ -55,6 +56,18 @@ func (c *Controller) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleCreateSession creates a session owned by this node and publishes
 // its ownership record so any node in the cluster can route to it.
 func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var req CreateSessionRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	id := hex.EncodeToString(b[:])
@@ -66,7 +79,7 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
 		return
 	}
-	c.sessions.Store(id, struct{}{})
+	c.sessions.Store(id, &Session{ID: id, Spec: req})
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
@@ -77,6 +90,31 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusNotImplemented, map[string]string{"error": "not implemented"})
+}
+
+// handleCreateToolResult accepts an externally reported tool result.
+// The request is routed to the session's owner node first (leaving the
+// body untouched for forwarding), then validated and queued on the
+// session for the agent runtime to consume.
+func (c *Controller) handleCreateToolResult(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	var req ToolResultRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	if err := req.Validate(); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	v, _ := c.sessions.Load(id)
+	v.(*Session).AddToolResult(req)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
 // handleDeleteSession releases the session on its owner node.
