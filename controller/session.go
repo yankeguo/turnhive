@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -9,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/yankeguo/ironhive"
+	"github.com/yankeguo/turnhive/agent"
 )
 
 // ProtocolOpenAICompletions is the only model protocol currently
@@ -21,19 +23,60 @@ type Session struct {
 	Spec CreateSessionRequest
 	// Sandbox is the ironhive sandbox allocated for this session.
 	Sandbox *ironhive.Sandbox
+	// Loop runs the agent turns of this session.
+	Loop *agent.Loop
 
 	mu sync.Mutex
-	// toolResults queues externally reported tool results until the
-	// agent runtime consumes them.
-	toolResults []ToolResultRequest
+	// pending holds tool results that arrived before the agent loop
+	// started waiting for them.
+	pending map[string]ToolResultRequest
+	// waiters holds the channels of tool calls the agent loop is
+	// currently blocked on.
+	waiters map[string]chan ToolResultRequest
 }
 
-// AddToolResult appends an externally reported tool result to the
-// session's queue.
+// AddToolResult delivers an externally reported tool result, either to a
+// waiting agent loop or into the pending buffer.
 func (s *Session) AddToolResult(r ToolResultRequest) {
 	s.mu.Lock()
-	s.toolResults = append(s.toolResults, r)
+	defer s.mu.Unlock()
+	if ch, ok := s.waiters[r.CallID]; ok {
+		delete(s.waiters, r.CallID)
+		ch <- r
+		return
+	}
+	if s.pending == nil {
+		s.pending = make(map[string]ToolResultRequest)
+	}
+	s.pending[r.CallID] = r
+}
+
+// WaitToolResult implements agent.ToolResultWaiter: it blocks until the
+// result of callID is reported via POST /v1/sessions/{id}/tool_results
+// or ctx is done.
+func (s *Session) WaitToolResult(ctx context.Context, callID string) (json.RawMessage, string, error) {
+	s.mu.Lock()
+	if r, ok := s.pending[callID]; ok {
+		delete(s.pending, callID)
+		s.mu.Unlock()
+		return r.Result, r.Error, nil
+	}
+	ch := make(chan ToolResultRequest, 1)
+	if s.waiters == nil {
+		s.waiters = make(map[string]chan ToolResultRequest)
+	}
+	s.waiters[callID] = ch
 	s.mu.Unlock()
+
+	select {
+	case r := <-ch:
+		return r.Result, r.Error, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.waiters, callID)
+		s.mu.Unlock()
+		return nil, "", ctx.Err()
+	}
 }
 
 // CreateSessionRequest is the JSON body of POST /v1/sessions.

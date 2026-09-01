@@ -15,6 +15,7 @@ import (
 	"github.com/yankeguo/turnhive/config"
 	"github.com/yankeguo/turnhive/controller"
 	"github.com/yankeguo/turnhive/registry"
+	"github.com/yankeguo/turnhive/storage"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -46,8 +47,12 @@ func main() {
 	log.Printf("node registered in etcd with lease TTL %s", time.Duration(cfg.Etcd.LeaseTTL))
 
 	mux := http.NewServeMux()
+	store, err := storage.New(cfg.S3)
+	if err != nil {
+		log.Fatalf("connect s3: %v", err)
+	}
 	ihClient := ironhive.NewClient(cfg.Ironhive.URL)
-	controller.New(cfg.Node.ID, reg, ihClient, time.Duration(cfg.Ironhive.Lease)).RegisterRoutes(mux)
+	controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease)).RegisterRoutes(mux)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
