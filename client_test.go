@@ -127,7 +127,7 @@ func TestSendMessageBusy(t *testing.T) {
 func serveEvents(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "id: 4\nevent: sync\ndata: {\"turn_id\":\"turn-abc\",\"seq\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}]}\n\n")
+	fmt.Fprint(w, "id: 4\nevent: sync\ndata: {\"turn_id\":\"turn-abc\",\"seq\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"hello\"}],\"persisted\":[{\"path\":\"report.txt\",\"object_key\":\"sessions/s1/persisted/report.txt\",\"size\":10,\"at\":\"2026-09-02T01:00:00Z\"}]}\n\n")
 	fmt.Fprint(w, ": keepalive\n\n")
 	fmt.Fprint(w, "id: 1\nevent: turn_started\ndata: {\"turn_id\":\"turn-abc\"}\n\n")
 	fmt.Fprint(w, "id: 2\nevent: delta\ndata: {\"turn_id\":\"turn-abc\",\"text\":\"Hel\"}\n\n")
@@ -161,6 +161,8 @@ func TestEventsStream(t *testing.T) {
 		{Type: EventSync, Seq: 4, TurnID: "turn-abc", Messages: []SyncMessage{
 			{Role: "user", Content: "hi"},
 			{Role: "assistant", Content: "hello"},
+		}, Persisted: []PersistedObject{
+			{Path: "report.txt", ObjectKey: "sessions/s1/persisted/report.txt", Size: 10, At: time.Date(2026, 9, 2, 1, 0, 0, 0, time.UTC)},
 		}},
 		{Type: EventTurnStarted, Seq: 1, TurnID: "turn-abc"},
 		{Type: EventDelta, Seq: 2, TurnID: "turn-abc", Text: "Hel"},

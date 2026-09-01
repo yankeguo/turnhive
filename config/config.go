@@ -28,6 +28,11 @@ const DefaultEtcdLeaseTTL = 10 * time.Second
 // when allocating a session sandbox.
 const DefaultIronhiveLease = 30 * time.Minute
 
+// DefaultSessionIdleTimeout is the default inactivity bound after which
+// a session's sandbox is released; the session lives on and the sandbox
+// is rebuilt on the next message.
+const DefaultSessionIdleTimeout = 30 * time.Minute
+
 // DefaultListen is the default address the HTTP server listens on.
 const DefaultListen = ":8080"
 
@@ -54,6 +59,17 @@ type Config struct {
 	Etcd   EtcdConfig `yaml:"etcd"`
 	// Ironhive holds the sandbox service connection settings.
 	Ironhive IronhiveConfig `yaml:"ironhive"`
+	// Session holds session lifecycle settings.
+	Session SessionConfig `yaml:"session"`
+}
+
+// SessionConfig holds session lifecycle settings.
+type SessionConfig struct {
+	// IdleTimeout bounds how long a session may be inactive (no turn
+	// activity) before its sandbox is released. The session itself lives
+	// on; the next message rebuilds the sandbox from skills and
+	// persisted files. Defaults to 30m.
+	IdleTimeout Duration `yaml:"idle_timeout"`
 }
 
 // IronhiveConfig holds the settings for reaching an ironhive controller,
@@ -198,6 +214,9 @@ func (c *Config) setDefaults() {
 	if c.Ironhive.Lease == 0 {
 		c.Ironhive.Lease = Duration(DefaultIronhiveLease)
 	}
+	if c.Session.IdleTimeout == 0 {
+		c.Session.IdleTimeout = Duration(DefaultSessionIdleTimeout)
+	}
 }
 
 func (c *Config) validate() error {
@@ -237,6 +256,9 @@ func (c *Config) validate() error {
 	}
 	if c.Ironhive.Lease <= 0 {
 		return fmt.Errorf("ironhive.lease must be positive")
+	}
+	if c.Session.IdleTimeout <= 0 {
+		return fmt.Errorf("session.idle_timeout must be positive")
 	}
 	return nil
 }

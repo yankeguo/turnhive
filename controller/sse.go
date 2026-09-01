@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/yankeguo/turnhive/agent"
 )
 
 // sseKeepalive is the interval between SSE comment lines that keep the
@@ -33,15 +35,16 @@ type syncMessage struct {
 
 // writeSSESync writes the sync control event a subscriber receives on
 // connect: the currently running turn ("" when idle), the latest
-// sequence number and the full merged history, so the client can
-// synchronize its state in one frame before the backlog replay. It
-// carries an SSE id like any other frame.
-func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []syncMessage) {
+// sequence number, the full merged history and the session's persisted
+// objects, so the client can synchronize its state in one frame before
+// the backlog replay. It carries an SSE id like any other frame.
+func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []syncMessage, persisted []agent.PersistedObject) {
 	payload, err := json.Marshal(struct {
-		TurnID   string        `json:"turn_id"`
-		Seq      int64         `json:"seq"`
-		Messages []syncMessage `json:"messages"`
-	}{TurnID: currentTurn, Seq: latestSeq, Messages: messages})
+		TurnID    string                  `json:"turn_id"`
+		Seq       int64                   `json:"seq"`
+		Messages  []syncMessage           `json:"messages"`
+		Persisted []agent.PersistedObject `json:"persisted"`
+	}{TurnID: currentTurn, Seq: latestSeq, Messages: messages, Persisted: persisted})
 	if err != nil {
 		return
 	}

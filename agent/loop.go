@@ -37,6 +37,15 @@ type LoopConfig struct {
 	// SupportImage enables the load_media tool (requires Sandbox); set it
 	// when the model accepts image inputs.
 	SupportImage bool
+	// PersistStore enables the persist tool (requires Sandbox): files are
+	// uploaded to it under sessions/{SessionID}/persisted/.
+	PersistStore PersistStore
+	// SessionID scopes the persist tool's object keys; required when
+	// PersistStore is set.
+	SessionID string
+	// OnPersisted is called after the persist tool stores a file, so the
+	// caller can record it as session state.
+	OnPersisted func(PersistedObject)
 	// ExternalTools are the client-defined tools executed externally.
 	ExternalTools []ExternalToolSpec
 	// Waiter supplies the results of external tool calls.
@@ -70,6 +79,9 @@ func NewLoop(cfg LoopConfig) *Loop {
 	if cfg.Sandbox != nil {
 		st := newSandboxTools(cfg.Sandbox)
 		l.tools = append(l.tools, st.list(cfg.SupportImage)...)
+		if cfg.PersistStore != nil {
+			l.tools = append(l.tools, sandboxPersist{t: st, store: cfg.PersistStore, sessionID: cfg.SessionID, onPersisted: cfg.OnPersisted})
+		}
 		l.spiller = st
 	}
 	l.tools = append(l.tools, ExternalTools(cfg.ExternalTools, cfg.Waiter, cfg.ExternalToolTimeout)...)
@@ -169,6 +181,14 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 	err := errors.New("max steps exceeded")
 	r.Error(err.Error())
 	return err
+}
+
+// LoadHistory eagerly loads the persisted history. RunTurn also loads
+// it lazily; call this when a Loop is rebuilt for a restored session so
+// history-dependent reads (e.g. the events sync frame) are correct
+// before the next turn.
+func (l *Loop) LoadHistory(ctx context.Context) error {
+	return l.loadHistory(ctx)
 }
 
 // loadHistory lazily loads the persisted history on the first turn.

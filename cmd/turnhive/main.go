@@ -52,7 +52,7 @@ func main() {
 		log.Fatalf("connect s3: %v", err)
 	}
 	ihClient := ironhive.NewClient(cfg.Ironhive.URL)
-	ctrl := controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease))
+	ctrl := controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease), time.Duration(cfg.Session.IdleTimeout))
 	ctrl.RegisterRoutes(mux)
 
 	srv := &http.Server{

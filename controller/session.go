@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/agent"
@@ -38,12 +40,84 @@ type Session struct {
 	// turnCancel cancels the running turn (DELETE session, node
 	// shutdown).
 	turnCancel context.CancelFunc
+	// lastActivity is the last time the session saw turn activity
+	// (message accepted, turn finished). The idle reaper releases the
+	// sandbox after idle_timeout without it; the session lives on.
+	lastActivity time.Time
 	// pending holds tool results that arrived before the agent loop
 	// started waiting for them.
 	pending map[string]ToolResultRequest
 	// waiters holds the channels of tool calls the agent loop is
 	// currently blocked on.
 	waiters map[string]chan ToolResultRequest
+	// persisted records every file the persist tool stored, keyed by
+	// in-sandbox path (re-persisting a path replaces the entry).
+	persisted map[string]agent.PersistedObject
+}
+
+// touch marks turn activity, pushing out the idle reaper.
+func (s *Session) touch() {
+	s.mu.Lock()
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+// idle reports whether the session has been inactive for at least d and
+// no turn is running.
+func (s *Session) idle(d time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnID == "" && time.Since(s.lastActivity) >= d
+}
+
+// hasSandbox reports whether the session currently holds a sandbox.
+func (s *Session) hasSandbox() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Sandbox != nil
+}
+
+// setSandbox installs a freshly built sandbox and its lease-renewal
+// cancel func.
+func (s *Session) setSandbox(sb *ironhive.Sandbox, stopRenew context.CancelFunc) {
+	s.mu.Lock()
+	s.Sandbox = sb
+	s.stopRenew = stopRenew
+	s.mu.Unlock()
+}
+
+// takeSandbox detaches the session's sandbox and its renew cancel func,
+// returning them for release (idle reaper, DELETE, shutdown).
+func (s *Session) takeSandbox() (*ironhive.Sandbox, context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, stop := s.Sandbox, s.stopRenew
+	s.Sandbox = nil
+	s.stopRenew = nil
+	return sb, stop
+}
+
+// recordPersisted records a persisted file as session state (the
+// agent.OnPersisted hook).
+func (s *Session) recordPersisted(obj agent.PersistedObject) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.persisted == nil {
+		s.persisted = make(map[string]agent.PersistedObject)
+	}
+	s.persisted[obj.Path] = obj
+}
+
+// Persisted returns the session's persisted objects, sorted by path.
+func (s *Session) Persisted() []agent.PersistedObject {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]agent.PersistedObject, 0, len(s.persisted))
+	for _, obj := range s.persisted {
+		out = append(out, obj)
+	}
+	slices.SortFunc(out, func(a, b agent.PersistedObject) int { return strings.Compare(a.Path, b.Path) })
+	return out
 }
 
 // startTurn marks a new turn as running, returning false when one is

@@ -61,3 +61,10 @@ ironhive:
   # periodically while the session is alive. A sandbox whose lease
   # expires is destroyed by ironhive. Default 30m.
   lease: 30m
+
+session:
+  # How long a session may be inactive (no turn activity) before its
+  # sandbox is released. The session itself lives on: the next message
+  # rebuilds the sandbox from skills and persisted files (see the
+  # persist tool). Default 30m.
+  idle_timeout: 30m

@@ -3,6 +3,8 @@ package controller
 import (
 	"strings"
 	"testing"
+
+	"github.com/yankeguo/turnhive/agent"
 )
 
 // validSessionRequest returns a minimal request that passes Validate.
@@ -45,5 +47,22 @@ func TestCreateSessionRequestValidateModelParams(t *testing.T) {
 	req = validSessionRequest()
 	if err := req.Validate(); err != nil {
 		t.Fatalf("default request rejected: %v", err)
+	}
+}
+
+func TestSessionRecordPersisted(t *testing.T) {
+	sess := &Session{}
+	sess.recordPersisted(agent.PersistedObject{Path: "b.txt", ObjectKey: "sessions/s/persisted/b.txt", Size: 1})
+	sess.recordPersisted(agent.PersistedObject{Path: "a.txt", ObjectKey: "sessions/s/persisted/a.txt", Size: 2})
+	// Re-persisting a path replaces the entry.
+	sess.recordPersisted(agent.PersistedObject{Path: "b.txt", ObjectKey: "sessions/s/persisted/b.txt", Size: 3})
+
+	got := sess.Persisted()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 objects after dedup, got %+v", got)
+	}
+	// Sorted by path; b.txt carries the latest size.
+	if got[0].Path != "a.txt" || got[1].Path != "b.txt" || got[1].Size != 3 {
+		t.Fatalf("unexpected persisted objects: %+v", got)
 	}
 }

@@ -62,7 +62,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 
 | 事件 | 数据 | 说明 |
 | --- | --- | --- |
-| `sync` | `{"turn_id","seq","messages"}` | 连接后的首帧：当前 turn（空闲为 ""）、最新序号，以及合并后的全部历史消息（{user, assistant} 对）——客户端凭此一帧完成同步 |
+| `sync` | `{"turn_id","seq","messages","persisted"}` | 连接后的首帧：当前 turn（空闲为 ""）、最新序号、合并后的全部历史消息（{user, assistant} 对），以及 session 已持久化的对象列表（persist 工具写入）——客户端凭此一帧完成同步 |
 | `turn_started` | `{"turn_id"}` | 一个 turn 开始 |
 | `delta` | `{"turn_id","text"}` | 模型输出增量 |
 | `reasoning_delta` | `{"turn_id","text"}` | 推理内容增量 |
@@ -83,7 +83,8 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 集群内部能力（对客户端不可见）：
 
 - 大模型调用（OpenAI-compatible 流式端点）
-- 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）
+- 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）；persist（把沙盒文件转存到 S3 `sessions/{id}/persisted/` 并记录为 session 属性，随 sync 帧下发）
+- session 无限恢复：沙盒空闲超 `session.idle_timeout` 被回收但 session 不销毁；下一条消息时自动重建沙盒（重装 skills、回灌 persisted 文件、从 S3 重载历史），会话无缝继续
 - 子 session 创建与结果汇聚（二期）
 
 ## 客户端用法

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -67,16 +68,73 @@ type Controller struct {
 	// sandboxLease is the lease duration requested when allocating a
 	// session sandbox.
 	sandboxLease time.Duration
+	// idleTimeout bounds session inactivity before the idle reaper
+	// releases the session's sandbox (the session lives on).
+	idleTimeout time.Duration
 
 	// sessions holds the sessions owned by this node, keyed by session ID.
 	sessions sync.Map
 	// proxies caches one reverse proxy per owner node address.
 	proxies sync.Map
+
+	sweeperStop chan struct{}
+	sweeperDone sync.WaitGroup
 }
 
-// New creates a Controller for the given node.
-func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *storage.Store, sandboxLease time.Duration) *Controller {
-	return &Controller{nodeID: nodeID, registry: reg, ironhive: ih, store: store, sandboxLease: sandboxLease}
+// New creates a Controller for the given node and starts the idle
+// reaper.
+func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *storage.Store, sandboxLease, idleTimeout time.Duration) *Controller {
+	c := &Controller{
+		nodeID: nodeID, registry: reg, ironhive: ih, store: store,
+		sandboxLease: sandboxLease, idleTimeout: idleTimeout,
+		sweeperStop: make(chan struct{}),
+	}
+	c.sweeperDone.Add(1)
+	go c.runSweeper()
+	return c
+}
+
+// runSweeper periodically releases the sandboxes of sessions that have
+// been idle past idleTimeout, until Close.
+func (c *Controller) runSweeper() {
+	defer c.sweeperDone.Done()
+	interval := c.idleTimeout / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.sweeperStop:
+			return
+		case <-ticker.C:
+			c.reapIdleSandboxes()
+		}
+	}
+}
+
+// reapIdleSandboxes releases the sandbox of every session that has been
+// inactive for at least idleTimeout. The session record, its event hub
+// and its persisted files survive; the sandbox is rebuilt on the next
+// message (see ensureSandbox).
+func (c *Controller) reapIdleSandboxes() {
+	c.sessions.Range(func(_, v any) bool {
+		sess, ok := v.(*Session)
+		if !ok || !sess.idle(c.idleTimeout) {
+			return true
+		}
+		sb, stop := sess.takeSandbox()
+		if sb == nil {
+			return true
+		}
+		if stop != nil {
+			stop()
+		}
+		log.Printf("session %s idle past %s, releasing sandbox %s", sess.ID, c.idleTimeout, sb.Name)
+		releaseSandbox(sb)
+		return true
+	})
 }
 
 // RegisterRoutes registers all routes on the given mux using the Go 1.22+
@@ -109,65 +167,103 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Allocate the sandbox before registering anything, so a failed
-	// allocation leaves no state behind.
+	id := newSessionID()
+	sess := &Session{ID: id, Spec: req, hub: newEventHub()}
+	sess.touch()
+
+	// Build the sandbox before registering anything, so a failure leaves
+	// no state behind.
 	allocCtx, allocCancel := context.WithTimeout(r.Context(), allocateTimeout)
 	defer allocCancel()
-	sandbox, err := c.ironhive.Allocate(allocCtx, req.Ironhive.Pool, c.sandboxLease)
-	if err != nil {
-		log.Printf("allocate sandbox from pool %q: %v", req.Ironhive.Pool, err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to allocate sandbox"})
+	if err := c.ensureSandbox(allocCtx, sess); err != nil {
+		log.Printf("prepare sandbox for session %s: %v", id, err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to prepare sandbox"})
 		return
 	}
 
-	// Install the skill tarballs into the sandbox via presigned URLs;
-	// the sandbox downloads them itself.
+	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
+	defer cancel()
+	if err := c.registry.RegisterSession(ctx, id); err != nil {
+		log.Printf("register session %s: %v", id, err)
+		if sb, stop := sess.takeSandbox(); sb != nil {
+			if stop != nil {
+				stop()
+			}
+			releaseSandbox(sb)
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
+		return
+	}
+	c.sessions.Store(id, sess)
+	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// buildLoop creates the agent Loop for a session from its spec and the
+// given sandbox. Called at creation and every time the sandbox is
+// rebuilt after an idle reap.
+func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.Loop {
+	req := sess.Spec
 	skillRefs := make([]agent.SkillRef, 0, len(req.Skills))
 	for _, s := range req.Skills {
 		skillRefs = append(skillRefs, agent.SkillRef{Name: s.Name, Description: s.Description, ObjectKey: s.ObjectKey})
 	}
-	if err = agent.InstallSkills(allocCtx, sandbox, c.store, skillRefs, skillsRoot, skillURLTTL); err != nil {
-		log.Printf("install skills: %v", err)
-		releaseSandbox(sandbox)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to install skills"})
-		return
-	}
-
-	id := newSessionID()
-
-	sess := &Session{ID: id, Spec: req, Sandbox: sandbox, hub: newEventHub()}
 	externalTools := make([]agent.ExternalToolSpec, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		externalTools = append(externalTools, agent.ExternalToolSpec{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
 	}
-	sess.Loop = agent.NewLoop(agent.LoopConfig{
+	return agent.NewLoop(agent.LoopConfig{
 		ModelURL:      req.Model.URL,
 		ModelHeaders:  req.Model.Headers,
 		ModelName:     req.Model.Name,
 		SystemPrompt:  agent.BuildSystemPrompt(req.Prompt.System, skillRefs, skillsRoot),
 		Sandbox:       sandbox,
 		SupportImage:  slices.Contains(req.Model.Features, ModelFeatureSupportImage),
+		PersistStore:  c.store,
+		SessionID:     sess.ID,
+		OnPersisted:   sess.recordPersisted,
 		ExternalTools: externalTools,
 		Waiter:        sess,
-		History:       agent.S3History(c.store, id),
+		History:       agent.S3History(c.store, sess.ID),
 	})
+}
 
-	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
-	defer cancel()
-	if err := c.registry.RegisterSession(ctx, id); err != nil {
-		log.Printf("register session %s: %v", id, err)
-		releaseSandbox(sandbox)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
-		return
+// ensureSandbox makes sure the session holds a live sandbox. When the
+// sandbox was reaped for idleness (sessions outlive sandboxes), it is
+// rebuilt: allocate, reinstall skills, restore persisted files, rebuild
+// the agent Loop (its history reloads from S3) and restart lease
+// renewal.
+func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
+	if sess.hasSandbox() {
+		return nil
 	}
-	// Keep the sandbox lease alive for as long as the session lives;
-	// without renewal ironhive destroys the sandbox when the lease
-	// granted at allocation time expires.
+	sandbox, err := c.ironhive.Allocate(ctx, sess.Spec.Ironhive.Pool, c.sandboxLease)
+	if err != nil {
+		return fmt.Errorf("allocate sandbox from pool %q: %w", sess.Spec.Ironhive.Pool, err)
+	}
+	skillRefs := make([]agent.SkillRef, 0, len(sess.Spec.Skills))
+	for _, s := range sess.Spec.Skills {
+		skillRefs = append(skillRefs, agent.SkillRef{Name: s.Name, Description: s.Description, ObjectKey: s.ObjectKey})
+	}
+	if err = agent.InstallSkills(ctx, sandbox, c.store, skillRefs, skillsRoot, skillURLTTL); err != nil {
+		releaseSandbox(sandbox)
+		return fmt.Errorf("install skills: %w", err)
+	}
+	if err = agent.RestorePersisted(ctx, sandbox, c.store, sess.Persisted()); err != nil {
+		releaseSandbox(sandbox)
+		return fmt.Errorf("restore persisted files: %w", err)
+	}
+	l := c.buildLoop(sess, sandbox)
+	if err = l.LoadHistory(ctx); err != nil {
+		releaseSandbox(sandbox)
+		return fmt.Errorf("load history: %w", err)
+	}
+	sess.Loop = l
+	// Keep the sandbox lease alive while the session holds it; without
+	// renewal ironhive destroys the sandbox when the lease expires.
 	renewCtx, stopRenew := context.WithCancel(context.Background())
-	sess.stopRenew = stopRenew
 	go c.renewSandbox(renewCtx, sandbox)
-	c.sessions.Store(id, sess)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+	sess.setSandbox(sandbox, stopRenew)
+	return nil
 }
 
 // renewSandbox renews the sandbox lease at half-lease intervals until ctx
@@ -238,11 +334,20 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "session_busy"})
 		return
 	}
+	sess.touch()
 	sess.hub.publish(turnID, "turn_started", map[string]string{"turn_id": turnID})
 	go func() {
 		defer sess.finishTurn()
 		defer cancel()
+		defer sess.touch()
 		rep := &hubReporter{hub: sess.hub, turnID: turnID}
+		// The sandbox may have been reaped for idleness; rebuild it from
+		// the session spec and persisted files first.
+		if err := c.ensureSandbox(ctx, sess); err != nil {
+			log.Printf("session %s turn %s: %v", id, turnID, err)
+			rep.Error("failed to prepare sandbox")
+			return
+		}
 		if err := sess.Loop.RunTurn(ctx, req.Content, rep); err != nil {
 			if errors.Is(err, agent.ErrBusy) {
 				// Unreachable given startTurn; publish so subscribers are
@@ -300,7 +405,7 @@ func (c *Controller) handleSessionEvents(w http.ResponseWriter, r *http.Request)
 	for _, m := range history {
 		messages = append(messages, syncMessage{Role: m.Role, Content: m.Content})
 	}
-	writeSSESync(w, currentTurn, latest, messages)
+	writeSSESync(w, currentTurn, latest, messages, sess.Persisted())
 	for _, ev := range backlog {
 		writeSSEFrame(w, ev)
 	}
@@ -366,11 +471,11 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	c.sessions.Delete(id)
 	if sess, ok := v.(*Session); ok {
 		sess.cancelTurn()
-		if sess.stopRenew != nil {
-			sess.stopRenew()
-		}
-		if sess.Sandbox != nil {
-			releaseSandbox(sess.Sandbox)
+		if sb, stop := sess.takeSandbox(); sb != nil {
+			if stop != nil {
+				stop()
+			}
+			releaseSandbox(sb)
 		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
@@ -381,20 +486,23 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// Close tears down every session owned by this node: it stops the lease
-// renewal loops and releases the sandboxes. It is called during graceful
-// shutdown, after the HTTP server has stopped, so no handler is still
-// touching the sessions map.
+// Close stops the idle reaper, then tears down every session owned by
+// this node: running turns are cancelled, lease renewal loops stopped
+// and sandboxes released. It is called during graceful shutdown, after
+// the HTTP server has stopped, so no handler is still touching the
+// sessions map.
 func (c *Controller) Close() {
+	close(c.sweeperStop)
+	c.sweeperDone.Wait()
 	c.sessions.Range(func(key, v any) bool {
 		c.sessions.Delete(key)
 		if sess, ok := v.(*Session); ok {
 			sess.cancelTurn()
-			if sess.stopRenew != nil {
-				sess.stopRenew()
-			}
-			if sess.Sandbox != nil {
-				releaseSandbox(sess.Sandbox)
+			if sb, stop := sess.takeSandbox(); sb != nil {
+				if stop != nil {
+					stop()
+				}
+				releaseSandbox(sb)
 			}
 		}
 		return true

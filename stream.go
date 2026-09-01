@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EventType identifies the kind of a Stream Event.
@@ -61,6 +62,9 @@ type Event struct {
 	// (completed turns as {user, assistant} pairs); empty for all other
 	// event types.
 	Messages []SyncMessage
+	// Persisted lists the files the session has stored to object storage
+	// via the persist tool; only set on the sync event.
+	Persisted []PersistedObject
 }
 
 // SyncMessage is one message of the merged history in a sync event.
@@ -69,18 +73,29 @@ type SyncMessage struct {
 	Content string `json:"content"`
 }
 
+// PersistedObject records one file a session persisted to object
+// storage. The object key is relative to the cluster's configured S3
+// prefix (same convention as SkillSpec.ObjectKey).
+type PersistedObject struct {
+	Path      string    `json:"path"`
+	ObjectKey string    `json:"object_key"`
+	Size      int64     `json:"size"`
+	At        time.Time `json:"at"`
+}
+
 // eventPayload is the JSON data carried by one SSE event; every event
 // kind decodes from the same flat shape.
 type eventPayload struct {
-	TurnID   string        `json:"turn_id"`
-	Seq      int64         `json:"seq"`
-	Text     string        `json:"text"`
-	ID       string        `json:"id"`
-	Name     string        `json:"name"`
-	Title    string        `json:"title"`
-	Status   string        `json:"status"`
-	Message  string        `json:"message"`
-	Messages []SyncMessage `json:"messages"`
+	TurnID    string            `json:"turn_id"`
+	Seq       int64             `json:"seq"`
+	Text      string            `json:"text"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Title     string            `json:"title"`
+	Status    string            `json:"status"`
+	Message   string            `json:"message"`
+	Messages  []SyncMessage     `json:"messages"`
+	Persisted []PersistedObject `json:"persisted"`
 }
 
 // Stream is the event stream of one turn, returned by SendMessage.
@@ -171,6 +186,7 @@ func (s *Stream) run() {
 			Status:  p.Status,
 			Message: p.Message,
 			Messages: p.Messages,
+			Persisted: p.Persisted,
 		}
 		return true
 	}
