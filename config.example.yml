@@ -26,8 +26,6 @@ s3:
   # Use path-style addressing (endpoint/bucket/key). Required by MinIO,
   # RustFS and many on-premise S3-compatible services.
   force_path_style: false
-  # Object key prefix, allows sharing one bucket across projects.
-  prefix: turnhive
 
 etcd:
   # At least one endpoint is required; list all cluster members for
