@@ -21,7 +21,10 @@ import (
 var UploadFileNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 
 // UploadsRoot is the in-sandbox directory, relative to the sandbox's
-// working directory, where user-provided files are placed.
+// working directory, where user-provided files are placed. It is the
+// only contract for referencing attached files in messages: turnhive
+// deliberately does not compose message markers — the caller decides
+// if, when and how a message mentions them.
 const UploadsRoot = ".agents/uploads"
 
 // UploadURLTTL is the validity of the presigned URLs file injection
@@ -85,9 +88,3 @@ func InjectUploads(ctx context.Context, sb *ironhive.Sandbox, store UploadStore,
 	}
 	return nil
 }
-
-// UploadsDoc is the documented contract for referencing attached files:
-// turnhive deliberately does not compose message markers — the caller
-// decides if, when and how a message mentions the files. This constant
-// only documents where they live.
-const UploadsDoc = "user-provided files are available in the sandbox under " + UploadsRoot + "/<name>"

@@ -115,38 +115,80 @@ func (c *Controller) handleCreateFiles(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// A live sandbox gets the files right away, so a message sent after
-	// this call always finds them on disk; a cold session (sandbox
-	// reaped) simply relies on the next build, which injects every
-	// recorded upload.
-	if sb, ok := sess.liveSandbox(); ok {
-		ctx, cancel := context.WithTimeout(r.Context(), filesInjectTimeout)
-		err := agent.InjectUploads(ctx, sb, c.store, records, agent.UploadURLTTL)
-		cancel()
-		if err != nil {
+	if err := c.attachFiles(r.Context(), sess, records); err != nil {
+		switch {
+		case errors.Is(err, errSessionClosed):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		case errors.Is(err, errTooManyFiles):
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		default:
 			log.Printf("session %s: inject files: %v", id, err)
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to inject files into the sandbox"})
-			return
 		}
-	}
-
-	for _, u := range records {
-		sess.recordUpload(u)
-	}
-	if len(sess.Uploads()) > uploadsNameCountCap {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": fmt.Sprintf("too many files (limit %d)", uploadsNameCountCap)})
 		return
 	}
 
 	// Persist the manifest so adoption restores the files. Best-effort
 	// like history saves: the in-memory state is authoritative, and a
 	// failed write only degrades crash recovery (logged).
-	if c.store != nil {
-		if err := writeFilesManifest(r.Context(), c.store, id, sess.Uploads()); err != nil {
-			log.Printf("session %s: write files manifest: %v", id, err)
-		}
+	if err := writeFilesManifest(r.Context(), c.store, id, sess.Uploads()); err != nil {
+		log.Printf("session %s: write files manifest: %v", id, err)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+var (
+	// errSessionClosed reports an attach racing the session's teardown
+	// (DELETE, shutdown, cold eviction) — the record would never reach a
+	// sandbox on this node.
+	errSessionClosed = errors.New("session closed")
+	// errTooManyFiles reports a session exceeding the per-session file
+	// count cap.
+	errTooManyFiles = errors.New("too many files")
+)
+
+// attachFiles records the uploads and, when the session holds a live
+// sandbox, injects them into it first, so a message sent after the
+// attach always finds the files on disk. filesMu is held across the
+// sandbox check and the injection: a concurrent detach (idle reap, cold
+// eviction, teardown) either happened before the attach (no sandbox —
+// the record waits for the next build) or after it (the injection
+// landed; the record is also persisted for the next build), but never
+// in between, which would accept a file into no sandbox at all.
+func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []agent.UploadRecord) error {
+	sess.filesMu.Lock()
+	defer sess.filesMu.Unlock()
+	if sess.isClosed() {
+		return errSessionClosed
+	}
+	if sb, ok := sess.liveSandbox(); ok {
+		injectCtx, cancel := context.WithTimeout(ctx, filesInjectTimeout)
+		err := agent.InjectUploads(injectCtx, sb, c.uploadStore, records, agent.UploadURLTTL)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	// Reject attachments that would grow the session past the cap
+	// *before* recording, so a rejected request leaves no partial state.
+	// Distinct names count; re-attaching an existing name replaces it.
+	known := make(map[string]bool)
+	for _, u := range sess.Uploads() {
+		known[u.Name] = true
+	}
+	added := 0
+	for _, u := range records {
+		if !known[u.Name] {
+			added++
+		}
+	}
+	if len(known)+added > uploadsNameCountCap {
+		return fmt.Errorf("%w (limit %d)", errTooManyFiles, uploadsNameCountCap)
+	}
+	for _, u := range records {
+		sess.recordUpload(u)
+	}
+	return nil
 }
 
 // SessionDetail is the response body of GET /v1/sessions/{id}: the

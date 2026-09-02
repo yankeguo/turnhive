@@ -4,13 +4,178 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/yankeguo/ironhive"
 	"github.com/yankeguo/turnhive/agent"
 )
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// uploadCall records one file injection into the fake sandbox.
+type uploadCall struct {
+	Path string
+	URL  string
+}
+
+// fakeUploadSandbox emulates just enough of ironhive for attach tests:
+// allocate returns a sandbox handle, and PUT /agent/v1/file?url= fetches
+// the URL itself (the presigned-URL injection path).
+type fakeUploadSandbox struct {
+	mu    sync.Mutex
+	calls []uploadCall
+}
+
+func (f *fakeUploadSandbox) handler(t *testing.T) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /controller/v1/allocate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"sandbox": "s", "leaseExpires": %s}`, jsonString(time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)))
+	})
+	mux.HandleFunc("PUT /agent/v1/file", func(w http.ResponseWriter, r *http.Request) {
+		u := r.URL.Query().Get("url")
+		if u == "" {
+			http.Error(w, "url required", http.StatusBadRequest)
+			return
+		}
+		resp, err := http.Get(u)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			http.Error(w, "fetch failed", http.StatusBadGateway)
+			return
+		}
+		resp.Body.Close()
+		f.mu.Lock()
+		f.calls = append(f.calls, uploadCall{Path: r.URL.Query().Get("path"), URL: u})
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message":"OK"}`))
+	})
+	return mux
+}
+
+func (f *fakeUploadSandbox) injected() []uploadCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uploadCall(nil), f.calls...)
+}
+
+// fakePresignStore serves presigned GETs from an in-memory map.
+type fakePresignStore struct {
+	objects map[string][]byte
+}
+
+func (f *fakePresignStore) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
+	body, ok := f.objects[key]
+	if !ok {
+		return "", fmt.Errorf("no such key: %s", key)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	return srv.URL, nil
+}
+
+func TestAttachFilesInjectsIntoLiveSandbox(t *testing.T) {
+	fake := &fakeUploadSandbox{}
+	srv := httptest.NewServer(fake.handler(t))
+	defer srv.Close()
+	sb, err := ironhive.NewClient(srv.URL).Allocate(context.Background(), "default", time.Minute)
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	store := &fakePresignStore{objects: map[string][]byte{"k1": []byte("x")}}
+	c := &Controller{uploadStore: store}
+	sess := &Session{ID: "s", hub: newEventHub()}
+	if !sess.setSandbox(sb, func() {}) {
+		t.Fatal("setSandbox must succeed")
+	}
+
+	recs := []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1", Size: 1}}
+	if err := c.attachFiles(context.Background(), sess, recs); err != nil {
+		t.Fatalf("attachFiles: %v", err)
+	}
+	calls := fake.injected()
+	if len(calls) != 1 || calls[0].Path != agent.UploadsRoot+"/a.txt" {
+		t.Fatalf("injected: %+v", calls)
+	}
+	if got := sess.Uploads(); len(got) != 1 || got[0].Name != "a.txt" {
+		t.Fatalf("uploads: %+v", got)
+	}
+}
+
+// TestAttachFilesAfterReap pins the ordering contract: an attach that
+// loses the race with a sandbox detach (filesMu) must still record the
+// file — it lands in the sandbox rebuilt on the next message.
+func TestAttachFilesAfterReap(t *testing.T) {
+	c := &Controller{}
+	sess := &Session{ID: "s", hub: newEventHub()}
+	sess.setSandbox(&ironhive.Sandbox{Name: "sb"}, func() {})
+	sess.mu.Lock()
+	sess.lastActivity = time.Now().Add(-time.Hour)
+	sess.mu.Unlock()
+
+	// Reap under filesMu, as the sweeper does.
+	sess.filesMu.Lock()
+	sb, _ := sess.takeSandboxIfIdle(time.Minute)
+	sess.filesMu.Unlock()
+	if sb == nil {
+		t.Fatal("idle session must be reaped")
+	}
+
+	// Attach afterwards: no sandbox, so nothing is injected, but the
+	// record is stored for the next build.
+	recs := []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1"}}
+	if err := c.attachFiles(context.Background(), sess, recs); err != nil {
+		t.Fatalf("attachFiles: %v", err)
+	}
+	if got := sess.Uploads(); len(got) != 1 {
+		t.Fatalf("uploads: %+v", got)
+	}
+}
+
+// TestAttachFilesRejectsClosedSession pins the DELETE race: attaching to
+// a closed session must fail rather than record files that no sandbox
+// will ever receive.
+func TestAttachFilesRejectsClosedSession(t *testing.T) {
+	c := &Controller{}
+	sess := &Session{ID: "s", hub: newEventHub()}
+	sess.closeSession()
+	err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1"}})
+	if !errors.Is(err, errSessionClosed) {
+		t.Fatalf("err = %v, want errSessionClosed", err)
+	}
+}
+
+func TestAttachFilesCap(t *testing.T) {
+	c := &Controller{}
+	sess := &Session{ID: "s", hub: newEventHub()}
+	for i := 0; i < uploadsNameCountCap; i++ {
+		sess.recordUpload(agent.UploadRecord{Name: fmt.Sprintf("f%02d.txt", i), ObjectKey: "k"})
+	}
+	// A new name past the cap is rejected without partial state.
+	err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "new.txt", ObjectKey: "k"}})
+	if !errors.Is(err, errTooManyFiles) {
+		t.Fatalf("err = %v, want errTooManyFiles", err)
+	}
+	if got := sess.Uploads(); len(got) != uploadsNameCountCap {
+		t.Fatalf("uploads after reject: %d", len(got))
+	}
+	// Re-attaching an existing name stays under the cap.
+	if err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "f00.txt", ObjectKey: "k2"}}); err != nil {
+		t.Fatalf("re-attach: %v", err)
+	}
+}
 
 func TestFilesManifestRoundTrip(t *testing.T) {
 	store := newFakeAdoptionStore()

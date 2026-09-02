@@ -68,9 +68,15 @@ type Session struct {
 	// persisted records every file the persist tool stored, keyed by
 	// in-sandbox path (re-persisting a path replaces the entry).
 	persisted map[string]agent.PersistedObject
+	// filesMu serializes user-file attachment against sandbox detaches
+	// (idle reap, cold eviction, teardown): an attach either injects
+	// into the sandbox it saw, or — the sandbox went away — leaves the
+	// record for the next build, but never accepts a file that reaches
+	// no sandbox.
+	filesMu sync.Mutex
 	// uploads records every user-provided file (an object key in the
 	// shared bucket), keyed by in-sandbox name; it is mirrored into
-	// Spec.Files so adoption restores it.
+	// files.json so adoption restores it.
 	uploads map[string]agent.UploadRecord
 	// bgExited holds background-process exits waiting to be reported as
 	// a synthesized user turn once the session is idle.
@@ -92,7 +98,9 @@ func (s *Session) hasSandbox() bool {
 }
 
 // liveSandbox returns the session's current sandbox, or false when the
-// session is closed or its sandbox was reaped.
+// session is closed or its sandbox was reaped. Callers that must not
+// lose work to a concurrent detach hold filesMu across the check and
+// the follow-up action (see attachFiles).
 func (s *Session) liveSandbox() (*ironhive.Sandbox, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,7 +226,10 @@ func (s *Session) Persisted() []agent.PersistedObject {
 }
 
 // recordUpload records a user-provided file as session state, keyed by
-// in-sandbox name (re-attaching a name replaces the entry).
+// in-sandbox name (re-attaching a name replaces the entry). Callers hold
+// filesMu (attachFiles) so a concurrent sandbox detach cannot strand the
+// record: it either got injected into the live sandbox or, having seen
+// none, will be injected by the next sandbox build.
 func (s *Session) recordUpload(u agent.UploadRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -226,6 +237,13 @@ func (s *Session) recordUpload(u agent.UploadRecord) {
 		s.uploads = make(map[string]agent.UploadRecord)
 	}
 	s.uploads[u.Name] = u
+}
+
+// isClosed reports whether the session has been torn down.
+func (s *Session) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // Uploads returns the session's user-provided files, sorted by name.

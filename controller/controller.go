@@ -94,6 +94,10 @@ type Controller struct {
 	// proxies caches one reverse proxy per owner node address.
 	proxies sync.Map
 
+	// uploadStore presigns downloads of user-provided files into
+	// sandboxes; in production it is store, tests substitute a fake.
+	uploadStore agent.UploadStore
+
 	sweeperStop chan struct{}
 	sweeperDone sync.WaitGroup
 }
@@ -106,6 +110,7 @@ func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *stor
 		sandboxLease: sandboxLease, idleTimeout: idleTimeout, coldTimeout: coldTimeout,
 		sweeperStop: make(chan struct{}),
 	}
+	c.uploadStore = store
 	c.sweeperDone.Add(1)
 	go c.runSweeper()
 	return c
@@ -148,7 +153,13 @@ func (c *Controller) evictColdSessions() {
 		if !ok {
 			return true
 		}
+		// filesMu orders the detach against a concurrent file attach:
+		// the attach either already injected into this sandbox (fine —
+		// the record is in the manifest for the next build too) or sees
+		// the sandbox gone and defers to the next build.
+		sess.filesMu.Lock()
 		sb, stop, evicted := sess.takeIfCold(c.coldTimeout)
+		sess.filesMu.Unlock()
 		if !evicted {
 			return true
 		}
@@ -198,7 +209,11 @@ func (c *Controller) reapIdleSandboxes() {
 		if !ok {
 			return true
 		}
+		// filesMu orders the detach against a concurrent file attach
+		// (see evictColdSessions).
+		sess.filesMu.Lock()
 		sb, stop := sess.takeSandboxIfIdle(c.idleTimeout)
+		sess.filesMu.Unlock()
 		if sb == nil {
 			return true
 		}
@@ -374,7 +389,7 @@ func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("restore persisted files: %w", err)
 	}
-	if err = agent.InjectUploads(ctx, sandbox, c.store, sess.Uploads(), skillURLTTL); err != nil {
+	if err = agent.InjectUploads(ctx, sandbox, c.uploadStore, sess.Uploads(), skillURLTTL); err != nil {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("inject user files: %w", err)
 	}
