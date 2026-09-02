@@ -2,8 +2,12 @@ package controller
 
 import (
 	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProxyRejectsInvalidAddress(t *testing.T) {
@@ -36,5 +40,57 @@ func TestWriteSSESyncHasNoFrameID(t *testing.T) {
 	}
 	if !strings.HasPrefix(out, "event: sync\n") || !strings.Contains(out, `"seq":7`) {
 		t.Fatalf("unexpected sync frame: %q", out)
+	}
+}
+
+func TestHandleCancelTurn(t *testing.T) {
+	c := &Controller{}
+	mux := http.NewServeMux()
+	c.RegisterRoutes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	sess := &Session{ID: "s", hub: newEventHub()}
+	c.sessions.Store("s", sess)
+
+	// Idle session: cancelling is a 409.
+	resp, err := http.Post(ts.URL+"/v1/sessions/s/cancel", "", nil)
+	if err != nil {
+		t.Fatalf("POST cancel (idle): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("idle cancel: status = %d, want 409", resp.StatusCode)
+	}
+
+	// A running turn, whose cancellation finishes the turn on its own
+	// goroutine (as the turn goroutine's defer would) — never
+	// synchronously, which would deadlock on the session lock inside
+	// CancelTurn.
+	sess.startTurn("turn-x", func() {
+		go func() {
+			time.Sleep(5 * time.Millisecond)
+			sess.finishTurn()
+		}()
+	})
+	resp, err = http.Post(ts.URL+"/v1/sessions/s/cancel", "", nil)
+	if err != nil {
+		t.Fatalf("POST cancel: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("cancel: status = %d, body %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"turn-x"`) {
+		t.Fatalf("cancel body should carry the turn id: %s", body)
+	}
+	// The handler returned only after finishTurn, so the session is idle
+	// and a resend would not hit session_busy.
+	if sess.TurnID() != "" {
+		t.Fatalf("session must be idle after cancel, running %q", sess.TurnID())
+	}
+	if !sess.startTurn("turn-y", func() {}) {
+		t.Fatal("resend after cancel must not hit session_busy")
 	}
 }

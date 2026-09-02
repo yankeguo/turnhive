@@ -212,6 +212,7 @@ func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", c.handleHealthz)
 	mux.HandleFunc("POST /v1/sessions", c.handleCreateSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", c.handleCreateMessage)
+	mux.HandleFunc("POST /v1/sessions/{id}/cancel", c.handleCancelTurn)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", c.handleSessionEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/tool_results", c.handleCreateToolResult)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", c.handleDeleteSession)
@@ -540,6 +541,40 @@ func buildBgExitMessage(exits []agent.BgProcessExit) string {
 	}
 	b.WriteString("</background_processes_exited>")
 	return b.String()
+}
+
+// handleCancelTurn interrupts the session's running turn: the turn's
+// context is cancelled so the agent loop aborts (the partial reply is
+// persisted and an error event is published), and the handler returns
+// only once finishTurn has cleared the busy mark — so the client can
+// resend its message immediately to continue (resend is the recovery;
+// the cancelled turn is not replayed or resumable).
+func (c *Controller) handleCancelTurn(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		// Lost a race with DELETE after routeSession.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := v.(*Session)
+
+	turnID, done := sess.CancelTurn()
+	if turnID == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "no_turn_running"})
+		return
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-r.Context().Done():
+			// Client gave up waiting; the cancel already took effect.
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"turn_id": turnID, "status": "cancelled"})
 }
 
 // handleSessionEvents streams the session's events as SSE. On connect

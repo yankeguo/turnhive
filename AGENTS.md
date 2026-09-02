@@ -53,6 +53,7 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 
 - session 同时只允许一个进行中的 turn，并发 POST messages 返回 409 `session_busy`。所有 JSON 请求体上限 4MB（`http.MaxBytesReader`）。
 - turn 异步执行：`POST messages` 立即返回 202 + turn_id，turn 在后台 goroutine 运行（脱离 POST 请求生命周期）；事件经独立通道 `GET .../events`（SSE）下发——eventHub 按 session 单调 seq、保留最近 2000 条缓冲、连接先发 `sync`（当前 turn + 最新 seq + 合并后的全部历史消息，取自 Loop 的 {user, assistant} 历史）、支持 `last_seq`/`Last-Event-ID` 断点重放、慢订阅者丢弃（客户端带 last_seq 重连自愈）；事件一律带 `turn_id` 供关联。`sync` 是控制帧，**不占事件序号、不写 SSE `id:`**（否则 EventSource 的 lastEventId 会被后续 backlog 帧拉低，重连时重复回放）；客户端解析无 `id` 帧时回退到 payload 内的 seq。
+- turn 中断：`POST .../cancel` 取消运行中 turn 的 ctx（`CancelTurn` 在锁内取消，杜绝"取消了个已结束 turn"竞态）→ `RunTurn` 的 stream 返回 ctx 错误 → `failTurn` 持久化 {user, assistant-partial} 并发布 `error` 事件；**取消端点等 `finishTurn` 清空 busy 后才返回**（`Session.turnDone` 通道），客户端立即重发不撞 `session_busy`——恢复 = 重发，不做 attach/自动重放。历史只存文本、不存 tool_calls，取消后的 working（含未答的 tool-call 对）即弃，无悬空对。
 - 外部工具回报（`POST tool_results`）：命中等待中的 call_id 直接唤醒；未匹配的暂存 `pending`（上限 256，超限返回 429），turn 结束时整体清空——迟到结果不会滞留内存，也不会被后续 turn 的同名 call_id 误消费。
 - 沙盒租约在 session 存活期间由 controller 按 lease/2 间隔自动续约；DELETE session、优雅关闭（`Controller.Close`）和 cold 换出（`takeIfCold`）三条路径都会停止续约并释放沙盒，DELETE/Close 还会先取消运行中的 turn——新增 session 生命周期路径时必须维护这三条清理路径。
 - 跨节点路由靠 etcd 归属记录 + `X-Turnhive-Forwarded` 头防转发循环；已转发的请求绝不二次转发（也绝不 adopt）。节点 keepalive 中断（租约失效）后 registry 会自动退避重试重新注册节点记录（1s 起步、上限 30s，直到成功或 Close），成功后经 `OnReconnected` 回调让 controller 把内存中的 session 归属记录重新注册（`ReregisterSessions`）。

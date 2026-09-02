@@ -228,6 +228,20 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (st
 	return resp.TurnID, nil
 }
 
+// CancelTurn interrupts the session's running turn and returns its id.
+// The turn is aborted (its partial reply is persisted and an error event
+// is streamed); to continue, send a new message — an interrupted turn is
+// never replayed or resumed.
+func (c *Client) CancelTurn(ctx context.Context, sessionID string) (string, error) {
+	var resp struct {
+		TurnID string `json:"turn_id"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/cancel", nil, &resp); err != nil {
+		return "", err
+	}
+	return resp.TurnID, nil
+}
+
 // Events opens the session event stream (GET .../events). Events from
 // all turns flow over it, sequenced per session; pass the last seen
 // Event.Seq as lastSeq to replay what was missed after a reconnect (0

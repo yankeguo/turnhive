@@ -43,9 +43,13 @@ type Session struct {
 	// turnID is the currently running turn ("" when idle); turns run
 	// detached from the HTTP request that started them.
 	turnID string
-	// turnCancel cancels the running turn (DELETE session, node
-	// shutdown).
+	// turnCancel cancels the running turn (cancel endpoint, DELETE
+	// session, node shutdown).
 	turnCancel context.CancelFunc
+	// turnDone is closed by finishTurn once the current turn has been
+	// marked finished; the cancel endpoint waits on it so a client can
+	// resend immediately after cancelling.
+	turnDone chan struct{}
 	// lastActivity is the last time the session saw turn activity
 	// (message accepted, turn finished). The idle reaper releases the
 	// sandbox after idle_timeout without it; the session lives on.
@@ -240,17 +244,24 @@ func (s *Session) startTurn(turnID string, cancel context.CancelFunc) bool {
 	}
 	s.turnID = turnID
 	s.turnCancel = cancel
+	s.turnDone = make(chan struct{})
 	return true
 }
 
 // finishTurn clears the running-turn mark when a turn ends and drops
 // tool results nobody claimed: late results of this turn (or forgeries
-// with fabricated call ids) must not leak into the next turn.
+// with fabricated call ids) must not leak into the next turn. The
+// turnDone channel is closed so anything waiting on it (the cancel
+// endpoint) is released as soon as the session is idle again.
 func (s *Session) finishTurn() {
 	s.mu.Lock()
 	s.turnID = ""
 	s.turnCancel = nil
 	s.pending = nil
+	if s.turnDone != nil {
+		close(s.turnDone)
+		s.turnDone = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -262,6 +273,29 @@ func (s *Session) cancelTurn() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// CancelTurn cancels the running turn and returns its id plus the channel
+// that closes once finishTurn has marked the session idle; it returns ""
+// when no turn is running. Cancelling inside the lock makes it
+// race-free: a turn that already finished is never reported as cancelled.
+func (s *Session) CancelTurn() (string, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnCancel == nil {
+		return "", nil
+	}
+	id := s.turnID
+	done := s.turnDone
+	s.turnCancel()
+	return id, done
+}
+
+// TurnID returns the id of the currently running turn ("" when idle).
+func (s *Session) TurnID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnID
 }
 
 // pendingToolResultsCap bounds tool results reported before the agent

@@ -404,3 +404,47 @@ func TestTakeIfCold(t *testing.T) {
 		t.Fatal("setSandbox must refuse an evicted session")
 	}
 }
+
+func TestCancelTurn(t *testing.T) {
+	sess := &Session{}
+
+	// No turn running: CancelTurn reports no origin.
+	if id, _ := sess.CancelTurn(); id != "" {
+		t.Fatalf("idle session: expected empty turn id, got %q", id)
+	}
+
+	// A running turn is cancelled; the returned channel closes only when
+	// finishTurn marks the session idle.
+	cancelCalled := false
+	if !sess.startTurn("turn-1", func() { cancelCalled = true }) {
+		t.Fatal("startTurn must succeed")
+	}
+	cancelCalled = false
+	id, done := sess.CancelTurn()
+	if id != "turn-1" || !cancelCalled {
+		t.Fatalf("CancelTurn: id=%q cancelCalled=%v, want turn-1/true", id, cancelCalled)
+	}
+	select {
+	case <-done:
+		t.Fatal("done must not be closed before finishTurn")
+	default:
+	}
+	sess.finishTurn()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Millisecond):
+		t.Fatal("done must close after finishTurn")
+	}
+	// The session is idle again: a resend would succeed.
+	if !sess.startTurn("turn-2", func() {}) {
+		t.Fatal("startTurn after a cancelled turn must succeed")
+	}
+	if id, _ := sess.CancelTurn(); id != "turn-2" {
+		t.Fatalf("second turn id = %q, want turn-2", id)
+	}
+	sess.finishTurn()
+	// A finished turn is not reported as cancelled.
+	if id, _ := sess.CancelTurn(); id != "" {
+		t.Fatalf("after finishTurn: expected empty turn id, got %q", id)
+	}
+}

@@ -18,6 +18,7 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 | --- | --- |
 | `POST /v1/sessions` | 创建 session，返回 session ID |
 | `POST /v1/sessions/{id}/messages` | 向 session 发送输入，异步受理，返回 turn ID |
+| `POST /v1/sessions/{id}/cancel` | 中断当前进行中的 turn（空闲时返回 409 `no_turn_running`）；恢复 = 重新发送消息 |
 | `GET /v1/sessions/{id}/events` | session 事件流（SSE）：所有 turn 的输出都经此通道下发 |
 | `POST /v1/sessions/{id}/tool_results` | 回报外部工具的执行结果 |
 | `DELETE /v1/sessions/{id}` | 销毁 session，释放其占用的集群资源 |
@@ -57,6 +58,10 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error":"session_busy"}`。
 
 所有 JSON 请求体的上限为 4MB，超限返回 400。
+
+### 中断 turn
+
+`POST /v1/sessions/{id}/cancel` 中断当前进行中的 turn：其上下文被取消、部分回复落盘并通过 `error` 事件收尾，返回 `202 {"turn_id":"...","status":"cancelled"}`（空闲时 `409 {"error":"no_turn_running"}`）。中断的 turn 不重放也不可恢复——客户端重新 `POST messages` 即视作恢复，之前已发出的 user 消息仍在历史中（write-ahead）。
 
 ### session 事件流（SSE）
 
