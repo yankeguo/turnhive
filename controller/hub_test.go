@@ -132,3 +132,37 @@ func TestHubCloseAll(t *testing.T) {
 		t.Fatal("fresh subscriber did not receive event after closeAll")
 	}
 }
+
+func TestHubReporterCancelEndsTurnCancelled(t *testing.T) {
+	h := newEventHub()
+	rep := &hubReporter{hub: h, turnID: "turn-1", cause: func() error { return errTurnCancelled }}
+	h.publish("turn-1", "turn_started", map[string]string{"turn_id": "turn-1"})
+	rep.Error("context canceled")
+
+	// The terminal event is turn_cancelled (not error), and it closes the
+	// hub's current-turn tracking like done/error would.
+	_, backlog, currentTurn, _ := h.subscribe(0)
+	if currentTurn != "" {
+		t.Fatalf("currentTurn = %q, want empty after turn_cancelled", currentTurn)
+	}
+	var last hubEvent
+	for _, ev := range backlog {
+		last = ev
+	}
+	if last.name != "turn_cancelled" {
+		t.Fatalf("last event = %q, want turn_cancelled", last.name)
+	}
+
+	// A failure (nil cause) still ends with an error event.
+	rep2 := &hubReporter{hub: h, turnID: "turn-2"}
+	h.publish("turn-2", "turn_started", map[string]string{"turn_id": "turn-2"})
+	rep2.Error("stream blew up")
+	_, backlog2, _, _ := h.subscribe(0)
+	var last2 hubEvent
+	for _, ev := range backlog2 {
+		last2 = ev
+	}
+	if last2.name != "error" {
+		t.Fatalf("last event = %q, want error", last2.name)
+	}
+}

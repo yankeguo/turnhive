@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 
 	"github.com/yankeguo/turnhive/agent"
@@ -58,7 +59,7 @@ func (h *eventHub) publish(turnID, name string, payload any) {
 	switch name {
 	case "turn_started":
 		h.currentTurn = turnID
-	case "done", "error":
+	case "done", "error", "turn_cancelled":
 		h.currentTurn = ""
 	}
 	for ch := range h.subs {
@@ -119,6 +120,10 @@ func (h *eventHub) closeAll() {
 type hubReporter struct {
 	hub    *eventHub
 	turnID string
+	// cause reports why the turn's context ended (context.Cause), or nil
+	// while it is running; it lets Error distinguish a turn interrupted
+	// through the cancel endpoint from a failed one.
+	cause func() error
 }
 
 func (r *hubReporter) Delta(text string) {
@@ -141,5 +146,12 @@ func (r *hubReporter) Done(text string) {
 }
 
 func (r *hubReporter) Error(msg string) {
+	// A turn interrupted through the cancel endpoint ends with a distinct
+	// turn_cancelled event, so subscribers can tell it apart from a
+	// failure (timeout, stream error, ...).
+	if r.cause != nil && errors.Is(r.cause(), errTurnCancelled) {
+		r.hub.publish(r.turnID, "turn_cancelled", map[string]string{"turn_id": r.turnID})
+		return
+	}
 	r.hub.publish(r.turnID, "error", map[string]string{"turn_id": r.turnID, "message": msg})
 }

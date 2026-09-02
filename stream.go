@@ -39,6 +39,10 @@ const (
 	EventDone EventType = "done"
 	// EventError ends a failed turn; Event.Message describes the failure.
 	EventError EventType = "error"
+	// EventTurnCancelled ends a turn interrupted through the cancel
+	// endpoint (Event.TurnID) — a user-initiated interruption, not a
+	// failure.
+	EventTurnCancelled EventType = "turn_cancelled"
 )
 
 // Tool call statuses of an EventToolCall event.

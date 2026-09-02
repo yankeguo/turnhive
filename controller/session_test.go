@@ -448,3 +448,25 @@ func TestCancelTurn(t *testing.T) {
 		t.Fatalf("after finishTurn: expected empty turn id, got %q", id)
 	}
 }
+
+func TestCancelTurnMarksCause(t *testing.T) {
+	sess := &Session{}
+	sess.startTurn("turn-1", func() {})
+	if sess.turnCause() != nil {
+		t.Fatalf("cause = %v before cancel, want nil", sess.turnCause())
+	}
+	sess.CancelTurn()
+	if sess.turnCause() != errTurnCancelled {
+		t.Fatalf("cause = %v, want errTurnCancelled", sess.turnCause())
+	}
+	sess.finishTurn()
+
+	// A new turn resets the cause; cancelTurn (DELETE/shutdown) leaves it
+	// nil, so the turn ends with an error event, not turn_cancelled.
+	sess.startTurn("turn-2", func() {})
+	sess.cancelTurn()
+	if sess.turnCause() != nil {
+		t.Fatalf("cause = %v after cancelTurn, want nil", sess.turnCause())
+	}
+	sess.finishTurn()
+}

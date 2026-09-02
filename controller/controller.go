@@ -52,6 +52,11 @@ func newTurnID() string {
 // turnTimeout bounds a single agent turn.
 const turnTimeout = time.Hour
 
+// errTurnCancelled is the context cause of a turn interrupted through the
+// cancel endpoint; it distinguishes a user-initiated interruption from a
+// failure (timeout, stream error) when the terminal event is published.
+var errTurnCancelled = errors.New("turn cancelled")
+
 // skillURLTTL is the validity of the presigned URLs a sandbox uses to
 // download skill tarballs.
 const skillURLTTL = 15 * time.Minute
@@ -481,7 +486,7 @@ func (c *Controller) runTurn(sess *Session, content string) (string, bool) {
 		}()
 		defer cancel()
 		defer sess.touch()
-		rep := &hubReporter{hub: sess.hub, turnID: turnID}
+		rep := &hubReporter{hub: sess.hub, turnID: turnID, cause: sess.turnCause}
 		// The sandbox may have been reaped for idleness; rebuild it from
 		// the session spec and persisted files first.
 		if err := c.ensureSandbox(ctx, sess); err != nil {
@@ -551,7 +556,9 @@ func buildBgExitMessage(exits []agent.BgProcessExit) string {
 // the cancelled turn is not replayed or resumable).
 func (c *Controller) handleCancelTurn(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !c.routeSession(w, r, id) {
+	// No adoption: a cold session has no running turn, so cancelling one
+	// must not recover it from storage first.
+	if !c.routeSessionMode(w, r, id, false) {
 		return
 	}
 	v, ok := c.sessions.Load(id)
@@ -747,10 +754,18 @@ func releaseSandbox(sb *ironhive.Sandbox) {
 }
 
 // routeSession ensures the request is handled on the node that owns the
-// session. It reports whether the session is local and the caller should
-// proceed; otherwise the response has already been written (forwarded to
-// the owner node, or an error).
+// session, adopting the session from storage when it is cold. It reports
+// whether the session is local and the caller should proceed; otherwise
+// the response has already been written.
 func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id string) bool {
+	return c.routeSessionMode(w, r, id, true)
+}
+
+// routeSessionMode is routeSession with control over adoption. The cancel
+// endpoint passes allowAdopt=false: a cold session has no running turn by
+// definition, so adopting it (S3 reads, an etcd claim) just to answer
+// no_turn_running would be wasted work.
+func (c *Controller) routeSessionMode(w http.ResponseWriter, r *http.Request, id string, allowAdopt bool) bool {
 	if _, ok := c.sessions.Load(id); ok {
 		return true
 	}
@@ -784,6 +799,10 @@ func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id str
 		return false
 	}
 	if !ok {
+		if !allowAdopt {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+			return false
+		}
 		// No owner record: the session may be cold — its owner node died
 		// (the lease took the record down) or it was evicted past
 		// cold_timeout. Adopt it from storage when a spec exists.

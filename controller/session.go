@@ -46,6 +46,10 @@ type Session struct {
 	// turnCancel cancels the running turn (cancel endpoint, DELETE
 	// session, node shutdown).
 	turnCancel context.CancelFunc
+	// turnCancelCause records why the running turn is being ended; the
+	// cancel endpoint sets it to errTurnCancelled so the terminal event
+	// reads as turn_cancelled instead of error. Reset on every startTurn.
+	turnCancelCause error
 	// turnDone is closed by finishTurn once the current turn has been
 	// marked finished; the cancel endpoint waits on it so a client can
 	// resend immediately after cancelling.
@@ -244,6 +248,7 @@ func (s *Session) startTurn(turnID string, cancel context.CancelFunc) bool {
 	}
 	s.turnID = turnID
 	s.turnCancel = cancel
+	s.turnCancelCause = nil
 	s.turnDone = make(chan struct{})
 	return true
 }
@@ -265,7 +270,9 @@ func (s *Session) finishTurn() {
 	s.mu.Unlock()
 }
 
-// cancelTurn aborts the running turn, if any.
+// cancelTurn aborts the running turn, if any (DELETE session, node
+// shutdown); the cause stays nil, so the turn still ends with an error
+// event rather than a turn_cancelled one.
 func (s *Session) cancelTurn() {
 	s.mu.Lock()
 	cancel := s.turnCancel
@@ -275,10 +282,12 @@ func (s *Session) cancelTurn() {
 	}
 }
 
-// CancelTurn cancels the running turn and returns its id plus the channel
+// CancelTurn marks the running turn as a user-initiated interruption
+// (errTurnCancelled) and cancels it, returning its id plus the channel
 // that closes once finishTurn has marked the session idle; it returns ""
-// when no turn is running. Cancelling inside the lock makes it
-// race-free: a turn that already finished is never reported as cancelled.
+// when no turn is running. Marking and cancelling inside the lock makes
+// it race-free: a turn that already finished is never reported as
+// cancelled.
 func (s *Session) CancelTurn() (string, <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -287,6 +296,7 @@ func (s *Session) CancelTurn() (string, <-chan struct{}) {
 	}
 	id := s.turnID
 	done := s.turnDone
+	s.turnCancelCause = errTurnCancelled
 	s.turnCancel()
 	return id, done
 }
@@ -296,6 +306,14 @@ func (s *Session) TurnID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.turnID
+}
+
+// turnCause returns why the current turn is being ended (nil while
+// running or when it failed rather than was cancelled).
+func (s *Session) turnCause() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnCancelCause
 }
 
 // pendingToolResultsCap bounds tool results reported before the agent

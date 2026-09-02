@@ -61,7 +61,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 
 ### 中断 turn
 
-`POST /v1/sessions/{id}/cancel` 中断当前进行中的 turn：其上下文被取消、部分回复落盘并通过 `error` 事件收尾，返回 `202 {"turn_id":"...","status":"cancelled"}`（空闲时 `409 {"error":"no_turn_running"}`）。中断的 turn 不重放也不可恢复——客户端重新 `POST messages` 即视作恢复，之前已发出的 user 消息仍在历史中（write-ahead）。
+`POST /v1/sessions/{id}/cancel` 中断当前进行中的 turn：其上下文被取消、部分回复落盘并通过 `turn_cancelled` 事件收尾（与失败区分开），返回 `202 {"turn_id":"...","status":"cancelled"}`（空闲时 `409 {"error":"no_turn_running"}`）。中断的 turn 不重放也不可恢复——客户端重新 `POST messages` 即视作恢复，之前已发出的 user 消息仍在历史中（write-ahead）。
 
 ### session 事件流（SSE）
 
@@ -76,6 +76,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 | `tool_call` | `{"turn_id","id","name","status"}` | 工具调用开始（`running`）/结束（`done`/`error`） |
 | `done` | `{"turn_id","text"}` | 本轮完成，text 为完整回复 |
 | `error` | `{"turn_id","message"}` | 本轮失败 |
+| `turn_cancelled` | `{"turn_id"}` | 本轮被 cancel 端点中断（用户主动中断，非失败） |
 
 ### 外部工具回报
 
