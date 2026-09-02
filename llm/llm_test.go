@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // sseServer returns an httptest server answering with the given SSE body.
@@ -350,5 +351,86 @@ func TestMessageImagesWire(t *testing.T) {
 	raw, _ = json.Marshal(Message{Role: "user", Content: "hi"})
 	if !strings.Contains(string(raw), `"content":"hi"`) {
 		t.Fatalf("text message must use string content: %s", raw)
+	}
+}
+
+// rateLimitServer answers the first `limited` requests with 429 (and the
+// given Retry-After header), then streams a one-delta completion. It
+// records the number of requests.
+func rateLimitServer(t *testing.T, limited int, retryAfter string) (*httptest.Server, *int) {
+	t.Helper()
+	count := new(int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*count++
+		if *count <= limited {
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":{"message":"slow down"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, count
+}
+
+func TestStreamRateLimitRetry(t *testing.T) {
+	srv, count := rateLimitServer(t, 2, "0")
+
+	msg, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if msg.Content != "ok" {
+		t.Errorf("Content = %q, want %q", msg.Content, "ok")
+	}
+	if *count != 3 {
+		t.Errorf("requests = %d, want 3 (2 rate limited + 1 success)", *count)
+	}
+}
+
+func TestStreamRateLimitExhausted(t *testing.T) {
+	srv, count := rateLimitServer(t, maxRateLimitRetries+10, "0")
+
+	_, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "status 429") {
+		t.Fatalf("expected a 429 error, got %v", err)
+	}
+	if *count != maxRateLimitRetries+1 {
+		t.Errorf("requests = %d, want %d (1 + %d retries)", *count, maxRateLimitRetries+1, maxRateLimitRetries)
+	}
+}
+
+func TestStreamRateLimitDefaultBackoff(t *testing.T) {
+	// No Retry-After header: exponential backoff from rateLimitBaseWait.
+	old := rateLimitBaseWait
+	rateLimitBaseWait = time.Millisecond
+	t.Cleanup(func() { rateLimitBaseWait = old })
+
+	srv, count := rateLimitServer(t, 1, "")
+	msg, _, err := Stream(context.Background(), Request{URL: srv.URL, Model: "m"}, nil)
+	if err != nil || msg.Content != "ok" {
+		t.Fatalf("Stream: msg=%+v err=%v", msg, err)
+	}
+	if *count != 2 {
+		t.Errorf("requests = %d, want 2", *count)
+	}
+}
+
+func TestStreamRateLimitWaitCancelled(t *testing.T) {
+	// A long Retry-After wait is abandoned when the context is cancelled.
+	srv, _ := rateLimitServer(t, 100, "30")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, _, err := Stream(ctx, Request{URL: srv.URL, Model: "m"}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }

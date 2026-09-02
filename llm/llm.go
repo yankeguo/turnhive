@@ -18,12 +18,26 @@ import (
 	"mime"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // maxErrorBody caps how much of a non-2xx response body is included in the
 // returned error.
 const maxErrorBody = 4096
+
+// maxRateLimitRetries bounds how many times a 429 (rate limited) response
+// is retried before the response is handed back as an error.
+const maxRateLimitRetries = 3
+
+// maxRateLimitWait caps a single backoff wait, however long the server's
+// Retry-After asks for; the caller's context is the outer bound.
+const maxRateLimitWait = time.Minute
+
+// rateLimitBaseWait is the first backoff wait for a 429 without a usable
+// Retry-After header; it doubles per retry. A var so tests can shrink it.
+var rateLimitBaseWait = time.Second
 
 // Message is one chat message. Assistant messages may carry ToolCalls;
 // tool result messages use Role "tool" with ToolCallID set.
@@ -219,6 +233,12 @@ type requestBody struct {
 // for each content/reasoning delta (onEvent may be nil). It returns the
 // fully accumulated assistant message (content + tool calls) and usage.
 //
+// A 429 (rate limited) response is retried with backoff, honoring the
+// server's Retry-After header when present — retries only ever happen
+// before the response is established, so no delta is ever delivered
+// twice. Other statuses, and a 429 persisting past maxRateLimitRetries,
+// fail immediately.
+//
 // Deadlines and cancellation come from ctx; the client sets no timeout of
 // its own. If the endpoint ignores stream=true and answers with a plain
 // JSON chat.completion, that response is decoded and returned instead.
@@ -228,21 +248,9 @@ func Stream(ctx context.Context, req Request, onEvent func(Event)) (Message, Usa
 		return Message{}, Usage{}, fmt.Errorf("marshal request body: %w", err)
 	}
 
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(body))
+	resp, err := postWithRateLimitRetry(ctx, req, body)
 	if err != nil {
-		return Message{}, Usage{}, fmt.Errorf("build request: %w", err)
-	}
-	hreq.Header.Set("Content-Type", "application/json")
-	for k, v := range req.Headers {
-		hreq.Header.Set(k, v)
-	}
-
-	resp, err := http.DefaultClient.Do(hreq)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Message{}, Usage{}, fmt.Errorf("post %s: %w", req.URL, ctxErr)
-		}
-		return Message{}, Usage{}, fmt.Errorf("post %s: %w", req.URL, err)
+		return Message{}, Usage{}, err
 	}
 	defer resp.Body.Close()
 
@@ -257,6 +265,61 @@ func Stream(ctx context.Context, req Request, onEvent func(Event)) (Message, Usa
 	}
 
 	return consumeStream(ctx, resp.Body, onEvent)
+}
+
+// postWithRateLimitRetry POSTs body to the endpoint, retrying 429
+// responses with backoff, and returns the established response. The
+// returned response may still carry a non-2xx status (including a 429
+// that outlasted the retries); the caller handles it.
+func postWithRateLimitRetry(ctx context.Context, req Request, body []byte) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		hreq.Header.Set("Content-Type", "application/json")
+		for k, v := range req.Headers {
+			hreq.Header.Set(k, v)
+		}
+
+		resp, err := http.DefaultClient.Do(hreq)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("post %s: %w", req.URL, ctxErr)
+			}
+			return nil, fmt.Errorf("post %s: %w", req.URL, err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt >= maxRateLimitRetries {
+			return resp, nil
+		}
+
+		// Rate limited: wait as the server asked (or exponential backoff)
+		// and retry. Nothing was streamed yet, so retrying is safe.
+		wait := rateLimitWait(resp.Header.Get("Retry-After"), attempt)
+		resp.Body.Close()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("post %s: %w", req.URL, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// rateLimitWait computes the backoff before the next attempt: the
+// Retry-After header (delta-seconds or HTTP-date) when present and valid,
+// exponential backoff otherwise, capped at maxRateLimitWait.
+func rateLimitWait(retryAfter string, attempt int) time.Duration {
+	if retryAfter != "" {
+		if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs >= 0 {
+			return min(time.Duration(secs)*time.Second, maxRateLimitWait)
+		}
+		if t, err := http.ParseTime(retryAfter); err == nil {
+			return min(max(time.Until(t), 0), maxRateLimitWait)
+		}
+	}
+	return min(rateLimitBaseWait<<attempt, maxRateLimitWait)
 }
 
 // marshalRequestBody builds the request body for req.

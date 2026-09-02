@@ -86,7 +86,7 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 
 集群内部能力（对客户端不可见）：
 
-- 大模型调用（OpenAI-compatible 流式端点）
+- 大模型调用（OpenAI-compatible 流式端点；429 限流响应按 `Retry-After` 退避重试，最多 3 次，未带 `Retry-After` 时指数退避——仅在响应建立前重试，流式开始后绝不重试）
 - 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）；persist（把沙盒文件转存到 S3 `sessions/{id}/persisted/` 并记录为 session 属性，随 sync 帧下发）
 - 上下文窗口管理（`model.max_context` 驱动）：每个 turn 前按估算整轮丢弃最旧历史（保留最近 turn 与回复预算），turn 用量超 0.8×窗口后把旧 turn 压缩为结构化 `<context-summary>` 摘要（保留最近 2 轮原文）
 - MCP 工具接入：`mcp_servers[]` 声明的 server 在每个 turn 开始时现场连接（单 server 连接+列工具 10s 上限），其工具以 `{name}__{tool}` 命名空间挂载、仅本 turn 有效，turn 结束全部断开；单个 server 失败只记日志，不拖垮其他 server 与 turn。`transport` 可选 `"streamable"` / `"sse"`，缺省 auto（先试 streamable HTTP，连接失败回退 legacy SSE）；不支持 stdio。`name` 须匹配 `^[a-zA-Z0-9_-]{1,32}$` 且在 `mcp_servers` 内唯一
