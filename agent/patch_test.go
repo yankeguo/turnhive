@@ -238,3 +238,28 @@ func TestApplyHunksContentOutsideHunksPreserved(t *testing.T) {
 		t.Fatalf("got %q, want %q", merged, want)
 	}
 }
+
+func TestParseUnifiedDiffRemovedAddedPairLooksLikeHeader(t *testing.T) {
+	// A removed "-- x;"/added "++ x;" pair renders as "--- x;"/"+++ x;"
+	// in the diff. The hunk's declared counts must keep both lines inside
+	// the hunk: otherwise the section is split at the phantom header, the
+	// hunk is silently truncated and a ghost "x;" file section appears.
+	patch := `--- a/main.c
++++ b/main.c
+@@ -1,3 +1,3 @@
+ int x = 1;
+--- x;
++++ x;
+`
+	files := parseUnifiedDiff(patch)
+	if len(files) != 1 {
+		t.Fatalf("expected exactly one file section, got %+v", files)
+	}
+	merged, err := applyHunksToText("int x = 1;\n-- x;\n", files[0].hunks, false)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if merged != "int x = 1;\n++ x;\n" {
+		t.Fatalf("got %q", merged)
+	}
+}

@@ -454,6 +454,12 @@ func (s sandboxApplyPatch) Execute(ctx context.Context, _ string, args json.RawM
 				}
 				return "", err
 			}
+		} else if _, err = s.t.getFile(ctx, abs); err == nil {
+			// A /dev/null creation must not silently overwrite an
+			// existing file.
+			return "", fmt.Errorf("file already exists: %s (patch declares /dev/null creation)", f.toPath)
+		} else if !isNotExist(err) {
+			return "", err
 		}
 		merged, err := applyHunksToText(existing, f.hunks, isNew)
 		if err != nil {
@@ -642,9 +648,20 @@ func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawM
 			}
 			return s.foregroundResult(ctx, o, stdoutFile, stderrFile)
 		case <-time.After(shellForegroundWindow):
-			// Not killed: falls through to the background reply. The
-			// outcome is discarded, so the threaded state only ever comes
+			// Not killed: falls through to the background reply. A
+			// result already sitting in the buffered channel — the
+			// command died right at the deadline — is still reported as
+			// a foreground completion; only a genuinely running command
+			// goes to the background. The threaded state only ever comes
 			// from commands that completed in the foreground.
+			select {
+			case o := <-done:
+				if o.err != nil {
+					return "", o.err
+				}
+				return s.foregroundResult(ctx, o, stdoutFile, stderrFile)
+			default:
+			}
 		case <-ctx.Done():
 			// Turn aborted: kill the still-foreground command's process
 			// group by cancelling the HTTP call.

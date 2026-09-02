@@ -79,12 +79,33 @@ func parseUnifiedDiff(patch string) []patchFile {
 			// above walks past them.
 			continue
 		}
-		// Collect hunks until the next file header. The "+++ " lookahead
-		// matters: a removed line whose original content starts with
-		// "-- " (e.g. an SQL comment) is itself "--- "-prefixed and must
-		// not be mistaken for the next file's header.
+		// Collect hunks line by line; a new file section only ever
+		// starts at a hunk boundary, so content lines that look like
+		// "--- "/"+++ " headers (e.g. a C "-- x;" removed next to its
+		// "++ x;" addition) are consumed as hunk content.
 		var hunks []string
-		for i < len(lines) && !isFileHeader(lines, i) {
+		for i < len(lines) {
+			if hunkHeader.MatchString(lines[i]) {
+				// Consume the hunk's declared number of body lines:
+				// this is what lets content lines that look like
+				// "--- "/"+++ " headers (e.g. a C "-- x;" removed next
+				// to its "++ x;" addition) be consumed as hunk content
+				// instead of ending the file section.
+				n, ok := countHunkBodyLines(lines[i+1:])
+				hunks = append(hunks, lines[i])
+				i++
+				if ok {
+					hunks = append(hunks, lines[i:i+n]...)
+					i += n
+				}
+				continue
+			}
+			if isFileHeader(lines, i) {
+				break
+			}
+			// A stray line between hunks ("\ No newline at end of
+			// file" and friends): keep it so nothing is silently
+			// dropped; the applier ignores what it does not need.
 			hunks = append(hunks, lines[i])
 			i++
 		}
@@ -98,6 +119,42 @@ func parseUnifiedDiff(patch string) []patchFile {
 		files = append(files, patchFile{fromPath: fromPath, toPath: toPath, hunks: hunkText})
 	}
 	return files
+}
+
+// countHunkBodyLines counts how many of lines belong to a hunk body:
+// everything up to the next hunk header, the next *safe* file header,
+// or EOF. Blank lines belong to the hunk (an empty context line is a
+// single space; a truly blank line is counted, and the applier's strict
+// matching rejects the corrupt result).
+func countHunkBodyLines(lines []string) (n int, ok bool) {
+	for n < len(lines) {
+		line := lines[n]
+		if hunkHeader.MatchString(line) || isSafeFileHeader(lines, n) {
+			return n, true
+		}
+		n++
+	}
+	return n, true
+}
+
+// isSafeFileHeader reports whether lines[i] unambiguously starts a new
+// file section: a "--- "/"+++ " header pair whose following line is a
+// hunk header, another "--- " header, or EOF. It exists to terminate a
+// hunk body: a removed "-- content"/added "++ content" pair also looks
+// like "--- "/"+++ ", but there the line after the "+++ " line is hunk
+// content, not another header — so the pair stays inside the hunk. The
+// corner it cannot cover (the removed line's replacement literally
+// being an @@ header, etc.) is rejected by the applier's strict
+// context matching rather than applied silently.
+func isSafeFileHeader(lines []string, i int) bool {
+	if !isFileHeader(lines, i) {
+		return false
+	}
+	if i+2 >= len(lines) {
+		return true
+	}
+	next := lines[i+2]
+	return hunkHeader.MatchString(next) || strings.HasPrefix(next, "--- ")
 }
 
 // isFileHeader reports whether lines[i] starts a new file section: a

@@ -32,3 +32,19 @@ func TestParseHistoryJSONLLongLine(t *testing.T) {
 		t.Fatalf("expected the long message, got %d messages", len(msgs))
 	}
 }
+
+func TestParseHistoryJSONLOversizedLineSkipped(t *testing.T) {
+	// A line beyond the cap is dropped without failing the load, and the
+	// lines around it still parse.
+	oversized := strings.Repeat("a", maxHistoryLineBytes+1)
+	body := `{"Role":"user","Content":"one"}` + "\n" +
+		`{"Role":"assistant","Content":"` + oversized + `"}` + "\n" +
+		`{"Role":"user","Content":"three"}` + "\n"
+	msgs, err := parseHistoryJSONL([]byte(body))
+	if err != nil {
+		t.Fatalf("an oversized line must not fail the load: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Content != "one" || msgs[1].Content != "three" {
+		t.Fatalf("expected the valid lines kept, got %d messages", len(msgs))
+	}
+}

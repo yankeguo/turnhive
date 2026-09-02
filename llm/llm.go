@@ -441,18 +441,23 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 				if reasoning != "" {
 					emit(onEvent, Event{Type: EventReasoning, Text: reasoning})
 				}
-				for _, tc := range delta.ToolCalls {
-					acc := toolCalls[tc.Index]
-					if acc == nil {
-						acc = &toolCallAccumulator{}
-						toolCalls[tc.Index] = acc
-					}
-					if tc.ID != "" {
-						acc.id = tc.ID
-					}
-					acc.name.WriteString(tc.Function.Name)
-					acc.arguments.WriteString(tc.Function.Arguments)
+			for _, tc := range delta.ToolCalls {
+				// A negative index is malformed; skipping beats
+				// misordering the assembled calls below.
+				if tc.Index < 0 {
+					continue
 				}
+				acc := toolCalls[tc.Index]
+				if acc == nil {
+					acc = &toolCallAccumulator{}
+					toolCalls[tc.Index] = acc
+				}
+				if tc.ID != "" {
+					acc.id = tc.ID
+				}
+				acc.name.WriteString(tc.Function.Name)
+				acc.arguments.WriteString(tc.Function.Arguments)
+			}
 			}
 		}
 		// Blank lines, comments ("..."), and other SSE fields are ignored.
@@ -475,10 +480,17 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 		sort.Ints(indexes)
 		for _, idx := range indexes {
 			acc := toolCalls[idx]
+			// A tool call whose arguments never streamed would leave an
+			// empty RawMessage that fails json.Unmarshal downstream;
+			// default to an empty object.
+			arguments := json.RawMessage(acc.arguments.String())
+			if len(arguments) == 0 {
+				arguments = json.RawMessage("{}")
+			}
 			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 				ID:        acc.id,
 				Name:      acc.name.String(),
-				Arguments: json.RawMessage(acc.arguments.String()),
+				Arguments: arguments,
 			})
 		}
 	}

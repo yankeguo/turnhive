@@ -262,12 +262,7 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	// be adoptable, so a failed write aborts the creation.
 	if err := writeSessionSpec(allocCtx, c.store, id, req); err != nil {
 		log.Printf("persist spec for session %s: %v", id, err)
-		if sb, stop := sess.takeSandbox(); sb != nil {
-			if stop != nil {
-				stop()
-			}
-			releaseSandbox(sb)
-		}
+		releaseSessionSandbox(sess)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to persist session spec"})
 		return
 	}
@@ -276,12 +271,7 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	defer cancel()
 	if err := c.registry.RegisterSession(ctx, id); err != nil {
 		log.Printf("register session %s: %v", id, err)
-		if sb, stop := sess.takeSandbox(); sb != nil {
-			if stop != nil {
-				stop()
-			}
-			releaseSandbox(sb)
-		}
+		releaseSessionSandbox(sess)
 		// Best-effort: leave no spec behind for a session that was never
 		// created, or a later request would adopt a ghost.
 		if derr := c.store.DeleteObject(ctx, specObjectKey(id)); derr != nil {
@@ -292,6 +282,17 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	}
 	c.sessions.Store(id, sess)
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// releaseSessionSandbox rolls back a failed session creation: detaches
+// the sandbox, stops its lease renewal and releases it.
+func releaseSessionSandbox(sess *Session) {
+	if sb, stop := sess.takeSandbox(); sb != nil {
+		if stop != nil {
+			stop()
+		}
+		releaseSandbox(sb)
+	}
 }
 
 // skillRefsOf converts the session spec's skills to agent skill refs.
@@ -579,7 +580,15 @@ func (c *Controller) handleCancelTurn(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-done:
 		case <-r.Context().Done():
-			// Client gave up waiting; the cancel already took effect.
+			// Client gave up waiting: the cancel already took effect,
+			// but finishTurn has not cleared the busy mark yet — a 202
+			// here would invite an immediate resend that collides with
+			// session_busy. Report the gateway timeout instead; the
+			// client tracks completion via the SSE turn_finished event.
+			writeJSON(w, http.StatusGatewayTimeout, map[string]string{
+				"error": "cancel pending; the turn is finishing",
+			})
+			return
 		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"turn_id": turnID, "status": "cancelled"})
@@ -720,6 +729,21 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// CloseSubscribers disconnects every SSE subscriber of every session
+// owned by this node, without touching session state. It is called
+// during graceful shutdown *before* http.Server.Shutdown: the events
+// handlers are infinite loops that only return when their subscription
+// channel closes or the request context ends, so Shutdown would
+// otherwise block on them until its timeout and report failure.
+func (c *Controller) CloseSubscribers() {
+	c.sessions.Range(func(_, v any) bool {
+		if sess, ok := v.(*Session); ok {
+			sess.hub.closeAll()
+		}
+		return true
+	})
+}
+
 // Close stops the idle reaper, then tears down every session owned by
 // this node: running turns are cancelled, lease renewal loops stopped
 // and sandboxes released. It is called during graceful shutdown, after
@@ -778,6 +802,10 @@ func (c *Controller) routeSessionMode(w http.ResponseWriter, r *http.Request, id
 		select {
 		case <-ch.(chan struct{}):
 		case <-r.Context().Done():
+			// The in-flight adoption outlived the client (or its
+			// patience): say so instead of hanging the connection open
+			// with no status at all.
+			writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "session adoption in progress"})
 			return false
 		}
 		if _, ok = c.sessions.Load(id); ok {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/yankeguo/turnhive/llm"
 	"github.com/yankeguo/turnhive/storage"
@@ -53,31 +54,41 @@ func (s *s3HistoryStore) Load(ctx context.Context) ([]llm.Message, error) {
 	return msgs, nil
 }
 
-// parseHistoryJSONL parses the JSONL history. A single malformed line is
-// skipped rather than failing the whole load — losing one line beats
-// bricking the session (a failed Load never marks the history ready, so
-// every later turn would fail too).
+// parseHistoryJSONL parses the JSONL history. A single malformed line —
+// including one exceeding the line size cap — is skipped rather than
+// failing the whole load: losing one line beats bricking the session (a
+// failed Load never marks the history ready, so every later turn would
+// fail too).
 func parseHistoryJSONL(body []byte) ([]llm.Message, error) {
 	var msgs []llm.Message
-	sc := bufio.NewScanner(bytes.NewReader(body))
-	// Allow very large single lines (e.g. a persisted long reply).
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
+	// A Scanner cannot skip an overlong line (ErrTooLong terminates the
+	// scan); ReadBytes returns the oversized line with its error and the
+	// next read continues after the newline.
+	r := bufio.NewReaderSize(bytes.NewReader(body), 64*1024)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(bytes.TrimSpace(line)) > 0 {
+			if len(line) > maxHistoryLineBytes {
+				// Oversized line: drop it, keep going.
+			} else {
+				var msg llm.Message
+				if jerr := json.Unmarshal(bytes.TrimSpace(line), &msg); jerr == nil {
+					msgs = append(msgs, msg)
+				}
+			}
 		}
-		var msg llm.Message
-		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
 		}
-		msgs = append(msgs, msg)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
 	}
 	return msgs, nil
 }
+
+// maxHistoryLineBytes caps a single JSONL line; a larger one is skipped.
+const maxHistoryLineBytes = 64 * 1024 * 1024
 
 // Save marshals all messages as JSONL and overwrites the object.
 func (s *s3HistoryStore) Save(ctx context.Context, msgs []llm.Message) error {

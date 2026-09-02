@@ -78,6 +78,14 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("grant lease: %w", err)
 	}
+	// Publish the new lease before anything else: RegisterSession and
+	// ClaimSession attach their records to whatever leaseID they read,
+	// and a record put under the previous (dying) lease would silently
+	// expire with it. The node record and keepalive below use the same
+	// local lease value, so an early swap is always safe.
+	r.mu.Lock()
+	r.leaseID = lease.ID
+	r.mu.Unlock()
 
 	value, err := json.Marshal(nodeRecord{Addr: r.advertise})
 	if err != nil {
@@ -133,9 +141,6 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 		}
 	}()
 
-	r.mu.Lock()
-	r.leaseID = lease.ID
-	r.mu.Unlock()
 	return nil
 }
 

@@ -24,9 +24,9 @@ const ProtocolOpenAICompletions = "openai_completions"
 type Session struct {
 	ID   string
 	Spec CreateSessionRequest
-	// Sandbox is the ironhive sandbox allocated for this session; access
+	// sandbox is the ironhive sandbox allocated for this session; access
 	// it through the mu-guarded helpers below.
-	Sandbox *ironhive.Sandbox
+	sandbox *ironhive.Sandbox
 	// hub sequences, buffers and fans out the session's events (see
 	// hub.go).
 	hub *eventHub
@@ -84,7 +84,7 @@ func (s *Session) touch() {
 func (s *Session) hasSandbox() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Sandbox != nil
+	return s.sandbox != nil
 }
 
 // setSandbox installs a freshly built sandbox and its lease-renewal
@@ -97,7 +97,7 @@ func (s *Session) setSandbox(sb *ironhive.Sandbox, stopRenew context.CancelFunc)
 	if s.closed {
 		return false
 	}
-	s.Sandbox = sb
+	s.sandbox = sb
 	s.stopRenew = stopRenew
 	return true
 }
@@ -107,8 +107,8 @@ func (s *Session) setSandbox(sb *ironhive.Sandbox, stopRenew context.CancelFunc)
 func (s *Session) takeSandbox() (*ironhive.Sandbox, context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sb, stop := s.Sandbox, s.stopRenew
-	s.Sandbox = nil
+	sb, stop := s.sandbox, s.stopRenew
+	s.sandbox = nil
 	s.stopRenew = nil
 	return sb, stop
 }
@@ -125,8 +125,8 @@ func (s *Session) takeSandboxIfIdle(d time.Duration) (*ironhive.Sandbox, context
 	if s.turnID != "" || time.Since(s.lastActivity) < d {
 		return nil, nil
 	}
-	sb, stop := s.Sandbox, s.stopRenew
-	s.Sandbox = nil
+	sb, stop := s.sandbox, s.stopRenew
+	s.sandbox = nil
 	s.stopRenew = nil
 	return sb, stop
 }
@@ -139,8 +139,8 @@ func (s *Session) closeSession() (*ironhive.Sandbox, context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
-	sb, stop := s.Sandbox, s.stopRenew
-	s.Sandbox = nil
+	sb, stop := s.sandbox, s.stopRenew
+	s.sandbox = nil
 	s.stopRenew = nil
 	return sb, stop
 }
@@ -159,8 +159,8 @@ func (s *Session) takeIfCold(d time.Duration) (*ironhive.Sandbox, context.Cancel
 		return nil, nil, false
 	}
 	s.closed = true
-	sb, stop := s.Sandbox, s.stopRenew
-	s.Sandbox = nil
+	sb, stop := s.sandbox, s.stopRenew
+	s.sandbox = nil
 	s.stopRenew = nil
 	return sb, stop, true
 }

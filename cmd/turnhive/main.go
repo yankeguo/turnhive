@@ -88,6 +88,12 @@ func main() {
 	failed := false
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Kick every SSE subscriber first: the events handlers are infinite
+	// loops that only return when their subscription channel closes, so
+	// Shutdown would block on them until the timeout and every shutdown
+	// would be logged as failed. Session state itself is torn down
+	// below, after the HTTP server has fully stopped.
+	ctrl.CloseSubscribers()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		// Degrade to a warning: the cleanup below (cancelling turns and
 		// releasing sandboxes) must still run before exiting non-zero.
