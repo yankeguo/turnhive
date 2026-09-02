@@ -55,6 +55,44 @@ type sandboxTools struct {
 	shellMu  sync.Mutex
 	shellCwd string
 	shellEnv []string
+
+	// onBgExit, when set, is called once for every backgrounded shell
+	// command that exits on its own (see watchBgProcess). Nil disables
+	// exit notification.
+	onBgExit func(BgProcessExit)
+}
+
+// BgProcessExit reports that a backgrounded shell command exited on its
+// own. It is the payload of the background-process exit notification.
+type BgProcessExit struct {
+	Pid     int
+	Command string
+	// ExitCode is the command's real exit code (from the .exit file), or
+	// -1 when it could not be determined.
+	ExitCode   int
+	StdoutFile string
+	StderrFile string
+	ExitFile   string
+}
+
+// watchBgProcess consumes the outcome of a backgrounded shell call. A
+// clean outcome means the command exited on its own and is reported
+// through onBgExit; a stream error means the sandbox (or the connection
+// to it) died — the command died with the sandbox, which is not an
+// "exit", so it is dropped silently.
+func (t *sandboxTools) watchBgProcess(done <-chan shellOutcome, pid int, command, stdoutFile, stderrFile, exitFile string) {
+	o := <-done
+	if o.err != nil || t.onBgExit == nil {
+		return
+	}
+	t.onBgExit(BgProcessExit{
+		Pid:        pid,
+		Command:    command,
+		ExitCode:   o.exitCode,
+		StdoutFile: stdoutFile,
+		StderrFile: stderrFile,
+		ExitFile:   exitFile,
+	})
 }
 
 // SandboxTools returns the tools that operate inside the sandbox: read,
@@ -466,7 +504,7 @@ Usage:
 - The first command runs in the sandbox working directory; cd and exported variables (use export, not plain assignments) persist to subsequent foreground shell calls within the session.
 - Stdout and stderr are captured separately and merged in the response.
 - Foreground commands return when they finish. A command still running after 30 seconds is NOT killed: it moves to the background and the tool returns its PID and stdout/stderr/exit-code file paths. Pass bg: true to get that behavior from the start (e.g. servers, watchers, long builds).
-- For backgrounded commands: poll output with tail/cat on the returned files; the exit-code file appears when the process exits; stop it (whole process group) with: kill -- -<pid>.
+- For backgrounded commands: you are notified automatically when the process exits (the notification arrives as a synthesized message; react to it autonomously). Check output anytime with tail/cat on the returned files; stop it (whole process group) with: kill -- -<pid>.
 - Backgrounded processes keep running even if the current turn ends; they die with the sandbox when the session is deleted.
 - Use for running scripts, build commands, git operations, etc.`,
 		Parameters: jsonSchema(map[string]any{
@@ -615,9 +653,16 @@ func (s sandboxShell) Execute(ctx context.Context, callID string, args json.RawM
 		}
 	}
 
+	// The command is running in the background. Watch its outcome so an
+	// exit on its own is reported (a stream error — the sandbox dying —
+	// is dropped silently by the watcher).
+	if s.t.onBgExit != nil {
+		go s.t.watchBgProcess(done, pid, a.Command, stdoutFile, stderrFile, exitFile)
+	}
 	return fmt.Sprintf("Command is running in the background (pid %d).\n"+
 		"stdout: %s\nstderr: %s\nexit code file (written on exit): %s\n"+
-		"Poll with tail/cat; stop it (whole process group) with: kill -- -%d",
+		"You will be notified automatically when it exits — no need to poll the exit code file.\n"+
+		"Check output with tail/cat; stop it (whole process group) with: kill -- -%d",
 		pid, stdoutFile, stderrFile, exitFile, pid), nil
 }
 

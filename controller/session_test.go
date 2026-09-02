@@ -95,6 +95,76 @@ func TestCreateSessionRequestValidateMCPServers(t *testing.T) {
 	}
 }
 
+func TestSessionBackgroundExitQueue(t *testing.T) {
+	sess := &Session{}
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 1, Command: "a"})
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 2, Command: "b"})
+
+	// take pops everything in order and empties the queue.
+	exits := sess.takeBackgroundExits()
+	if len(exits) != 2 || exits[0].Pid != 1 || exits[1].Pid != 2 {
+		t.Fatalf("unexpected exits: %+v", exits)
+	}
+	if got := sess.takeBackgroundExits(); got != nil {
+		t.Fatalf("queue must be empty after take, got %+v", got)
+	}
+
+	// requeue restores the popped exits at the head, preserving order.
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 3, Command: "c"})
+	sess.requeueBackgroundExits(exits)
+	got := sess.takeBackgroundExits()
+	if len(got) != 3 || got[0].Pid != 1 || got[1].Pid != 2 || got[2].Pid != 3 {
+		t.Fatalf("requeue must preserve order: %+v", got)
+	}
+
+	// A closed session drops its queue and ignores new exits.
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 4, Command: "d"})
+	sess.closeSession()
+	if got := sess.takeBackgroundExits(); got != nil {
+		t.Fatalf("closed session must drop its queue, got %+v", got)
+	}
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 5, Command: "e"})
+	if got := sess.takeBackgroundExits(); got != nil {
+		t.Fatalf("closed session must ignore new exits, got %+v", got)
+	}
+}
+
+func TestDrainBackgroundExitsBusyRequeues(t *testing.T) {
+	c := &Controller{}
+	sess := &Session{ID: "s", hub: newEventHub()}
+	// Hold the busy mark so the notification turn cannot start.
+	if !sess.startTurn("turn-x", func() {}) {
+		t.Fatal("startTurn on a fresh session must succeed")
+	}
+	sess.recordBackgroundExit(agent.BgProcessExit{Pid: 1, Command: "a"})
+
+	c.drainBackgroundExits(sess)
+
+	exits := sess.takeBackgroundExits()
+	if len(exits) != 1 || exits[0].Pid != 1 {
+		t.Fatalf("busy drain must requeue the exits: %+v", exits)
+	}
+}
+
+func TestBuildBgExitMessage(t *testing.T) {
+	msg := buildBgExitMessage([]agent.BgProcessExit{
+		{Pid: 42, Command: "make build", ExitCode: 2, StdoutFile: ".agents/shell-logs/c1.stdout", StderrFile: ".agents/shell-logs/c1.stderr"},
+		{Pid: 43, Command: "sleep 9", ExitCode: -1, StdoutFile: ".agents/shell-logs/c2.stdout", StderrFile: ".agents/shell-logs/c2.stderr"},
+	})
+	for _, want := range []string{
+		"<background_processes_exited>",
+		"</background_processes_exited>",
+		"do NOT ask the user questions",
+		"pid: 42", "command: make build", "exit_code: 2",
+		"stdout: .agents/shell-logs/c1.stdout", "stderr: .agents/shell-logs/c1.stderr",
+		"pid: 43", "exit_code: unknown",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing %q:\n%s", want, msg)
+		}
+	}
+}
+
 func TestSessionRecordPersisted(t *testing.T) {
 	sess := &Session{}
 	sess.recordPersisted(agent.PersistedObject{Path: "b.txt", ObjectKey: "sessions/s/persisted/b.txt", Size: 1})

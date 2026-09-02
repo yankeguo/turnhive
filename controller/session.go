@@ -59,6 +59,9 @@ type Session struct {
 	// persisted records every file the persist tool stored, keyed by
 	// in-sandbox path (re-persisting a path replaces the entry).
 	persisted map[string]agent.PersistedObject
+	// bgExited holds background-process exits waiting to be reported as
+	// a synthesized user turn once the session is idle.
+	bgExited []agent.BgProcessExit
 }
 
 // touch marks turn activity, pushing out the idle reaper.
@@ -168,6 +171,43 @@ func (s *Session) Persisted() []agent.PersistedObject {
 	}
 	slices.SortFunc(out, func(a, b agent.PersistedObject) int { return strings.Compare(a.Path, b.Path) })
 	return out
+}
+
+// recordBackgroundExit queues a background-process exit for reporting
+// as a synthesized user turn (the agent.OnBackgroundExit hook). Exits
+// arriving after the session is closed are ignored.
+func (s *Session) recordBackgroundExit(info agent.BgProcessExit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.bgExited = append(s.bgExited, info)
+}
+
+// takeBackgroundExits pops every queued background-process exit. A
+// closed session drops its queue instead of reporting it.
+func (s *Session) takeBackgroundExits() []agent.BgProcessExit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || len(s.bgExited) == 0 {
+		return nil
+	}
+	exits := s.bgExited
+	s.bgExited = nil
+	return exits
+}
+
+// requeueBackgroundExits puts exits back at the head of the queue,
+// preserving order, when their notification turn could not start
+// because the session was busy.
+func (s *Session) requeueBackgroundExits(exits []agent.BgProcessExit) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.bgExited = append(exits, s.bgExited...)
 }
 
 // startTurn marks a new turn as running, returning false when one is

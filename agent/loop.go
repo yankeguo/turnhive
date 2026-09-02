@@ -64,6 +64,10 @@ type LoopConfig struct {
 	// OnMCPStatus is called once per configured MCP server at the start
 	// of every turn with the connection result; nil disables reporting.
 	OnMCPStatus func(MCPServerStatus)
+	// OnBackgroundExit is called once for every backgrounded shell
+	// command that exits on its own; nil disables background-process
+	// exit notification.
+	OnBackgroundExit func(BgProcessExit)
 	// MaxContext is the model's context window in tokens; zero disables
 	// context window management. When set, the history is trimmed before
 	// every turn (TruncateToFit) and compacted after a turn whose usage
@@ -92,6 +96,7 @@ func NewLoop(cfg LoopConfig) *Loop {
 	l := &Loop{cfg: cfg, stream: llm.Stream}
 	if cfg.Sandbox != nil {
 		st := newSandboxTools(cfg.Sandbox)
+		st.onBgExit = cfg.OnBackgroundExit
 		l.tools = append(l.tools, st.list(cfg.SupportImage)...)
 		if cfg.PersistStore != nil {
 			l.tools = append(l.tools, sandboxPersist{t: st, store: cfg.PersistStore, sessionID: cfg.SessionID, onPersisted: cfg.OnPersisted})

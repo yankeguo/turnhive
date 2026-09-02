@@ -247,6 +247,14 @@ func (c *Controller) buildLoop(sess *Session, sandbox *ironhive.Sandbox) *agent.
 				log.Printf("session %s mcp %s: %d tools mounted", sess.ID, st.Name, st.ToolCount)
 			}
 		},
+		// A backgrounded command that exits on its own is queued and
+		// drained into a synthesized user turn; a busy session holds the
+		// queue until the running turn completes.
+		OnBackgroundExit: func(info agent.BgProcessExit) {
+			log.Printf("session %s background process %d exited (code %d)", sess.ID, info.Pid, info.ExitCode)
+			sess.recordBackgroundExit(info)
+			c.drainBackgroundExits(sess)
+		},
 	})
 }
 
@@ -352,39 +360,100 @@ func (c *Controller) handleCreateMessage(w http.ResponseWriter, r *http.Request)
 	}
 	sess := v.(*Session)
 
-	// The turn runs detached from this request: a client disconnect does
-	// not abort it (DELETE session or node shutdown does).
+	turnID, started := c.runTurn(sess, req.Content)
+	if !started {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "session_busy"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"turn_id": turnID})
+}
+
+// runTurn starts a detached turn for content (a client message or a
+// cluster-synthesized one, e.g. the background-process exit
+// notification) and reports the new turn id; a session runs one turn at
+// a time, so it returns "" when a turn is already running. The turn
+// runs detached from any HTTP request: a client disconnect does not
+// abort it (DELETE session or node shutdown does), and all of its
+// events flow over the session event stream.
+func (c *Controller) runTurn(sess *Session, content string) (string, bool) {
 	turnID := newTurnID()
 	ctx, cancel := context.WithTimeout(context.Background(), turnTimeout)
 	if !sess.startTurn(turnID, cancel) {
 		cancel()
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "session_busy"})
-		return
+		return "", false
 	}
 	sess.touch()
 	sess.hub.publish(turnID, "turn_started", map[string]string{"turn_id": turnID})
 	go func() {
-		defer sess.finishTurn()
+		// A finished turn is the drain trigger for queued background
+		// exits: finishTurn clears the busy mark first, so the drain can
+		// start their notification turn immediately.
+		defer func() {
+			sess.finishTurn()
+			c.drainBackgroundExits(sess)
+		}()
 		defer cancel()
 		defer sess.touch()
 		rep := &hubReporter{hub: sess.hub, turnID: turnID}
 		// The sandbox may have been reaped for idleness; rebuild it from
 		// the session spec and persisted files first.
 		if err := c.ensureSandbox(ctx, sess); err != nil {
-			log.Printf("session %s turn %s: %v", id, turnID, err)
+			log.Printf("session %s turn %s: %v", sess.ID, turnID, err)
 			rep.Error("failed to prepare sandbox")
 			return
 		}
-		if err := sess.getLoop().RunTurn(ctx, req.Content, rep); err != nil {
+		if err := sess.getLoop().RunTurn(ctx, content, rep); err != nil {
 			if errors.Is(err, agent.ErrBusy) {
 				// Unreachable given startTurn; publish so subscribers are
 				// not stuck watching an open turn.
 				rep.Error("session busy")
 			}
-			log.Printf("session %s turn %s: %v", id, turnID, err)
+			log.Printf("session %s turn %s: %v", sess.ID, turnID, err)
 		}
 	}()
-	writeJSON(w, http.StatusAccepted, map[string]string{"turn_id": turnID})
+	return turnID, true
+}
+
+// drainBackgroundExits reports queued background-process exits as one
+// synthesized user message in a new turn (aligned with the agentdesk
+// runner's bg-notifier): the agent reacts to the exits immediately
+// instead of learning about them from the user's next message. Exits
+// accumulated while a turn is running coalesce into a single message;
+// when the session is busy the queue goes back and the running turn's
+// completion drains it again.
+func (c *Controller) drainBackgroundExits(sess *Session) {
+	exits := sess.takeBackgroundExits()
+	if len(exits) == 0 {
+		return
+	}
+	if _, started := c.runTurn(sess, buildBgExitMessage(exits)); !started {
+		sess.requeueBackgroundExits(exits)
+	}
+}
+
+// buildBgExitMessage renders the synthesized user message reporting
+// background-process exits. The note steers the agent: no interactive
+// user is present, so it must not ask questions unless strictly
+// necessary. Format follows the agentdesk runner: bare open/close tags,
+// metadata as `key: value` lines.
+func buildBgExitMessage(exits []agent.BgProcessExit) string {
+	var b strings.Builder
+	b.WriteString("<background_processes_exited>\n")
+	b.WriteString("note: Automated notification: these background processes have exited. React autonomously " +
+		"(inspect the output files, continue any follow-up work); do NOT ask the user questions " +
+		"unless strictly necessary.\n")
+	for _, e := range exits {
+		exitCode := strconv.Itoa(e.ExitCode)
+		if e.ExitCode < 0 {
+			exitCode = "unknown"
+		}
+		b.WriteString("\n<process>\n")
+		fmt.Fprintf(&b, "pid: %d\ncommand: %s\nexit_code: %s\nstdout: %s\nstderr: %s\n",
+			e.Pid, e.Command, exitCode, e.StdoutFile, e.StderrFile)
+		b.WriteString("</process>\n")
+	}
+	b.WriteString("</background_processes_exited>")
+	return b.String()
 }
 
 // handleSessionEvents streams the session's events as SSE. On connect

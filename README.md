@@ -91,6 +91,7 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 - 上下文窗口管理（`model.max_context` 驱动）：每个 turn 前按估算整轮丢弃最旧历史（保留最近 turn 与回复预算），turn 用量超 0.8×窗口后把旧 turn 压缩为结构化 `<context-summary>` 摘要（保留最近 2 轮原文）
 - MCP 工具接入：`mcp_servers[]` 声明的 server 在每个 turn 开始时现场连接（单 server 连接+列工具 10s 上限），其工具以 `{name}__{tool}` 命名空间挂载、仅本 turn 有效，turn 结束全部断开；单个 server 失败只记日志，不拖垮其他 server 与 turn。`transport` 可选 `"streamable"` / `"sse"`，缺省 auto（先试 streamable HTTP，连接失败回退 legacy SSE）；不支持 stdio。`name` 须匹配 `^[a-zA-Z0-9_-]{1,32}$` 且在 `mcp_servers` 内唯一
 - session 无限恢复：沙盒空闲超 `session.idle_timeout` 被回收但 session 不销毁；下一条消息时自动重建沙盒（重装 skills、回灌 persisted 文件、从 S3 重载历史），会话无缝继续
+- 后台进程退出通知：shell 后台命令（`bg: true` 或超 30s 前台窗口）退出时，集群自动合成一条 user 消息（`<background_processes_exited>`，含 pid/command/exit_code/输出文件路径）并开一个新 turn，Agent 立即自行善后（查输出、继续后续工作）；turn 运行中积累的多个退出会合并为一条消息、turn 结束自动补发。对客户端完全透明——合成 turn 就是普通 turn，消息以 user 身份出现在事件流与历史中
 - 子 session 创建与结果汇聚（二期）
 
 ## 客户端用法

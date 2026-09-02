@@ -266,6 +266,40 @@ func TestSandboxShellBackground(t *testing.T) {
 	}
 }
 
+func TestSandboxShellBackgroundExitNotification(t *testing.T) {
+	sb, _ := newFakeIronhive(t)
+	st := newSandboxTools(sb)
+	exits := make(chan BgProcessExit, 1)
+	st.onBgExit = func(info BgProcessExit) { exits <- info }
+	tools := st.list(false)
+
+	out, err := callTool(t, tools, "shell", `{"command": "exit 3", "bg": true}`)
+	if err != nil {
+		t.Fatalf("shell bg: %v", err)
+	}
+	if !strings.Contains(out, "notified automatically when it exits") {
+		t.Fatalf("bg reply should promise the exit notification: %q", out)
+	}
+
+	select {
+	case info := <-exits:
+		if info.Pid <= 0 {
+			t.Fatalf("expected a real pid, got %d", info.Pid)
+		}
+		if info.ExitCode != 3 {
+			t.Fatalf("expected exit code 3, got %d", info.ExitCode)
+		}
+		if info.Command != "exit 3" {
+			t.Fatalf("unexpected command %q", info.Command)
+		}
+		if !strings.Contains(info.StdoutFile, shellLogsDir) || !strings.Contains(info.ExitFile, shellLogsDir) {
+			t.Fatalf("unexpected output files: %+v", info)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("background exit was never reported")
+	}
+}
+
 func TestSandboxReadSelfTruncates(t *testing.T) {
 	sb, f := newFakeIronhive(t)
 	tools := SandboxTools(sb)
