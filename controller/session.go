@@ -47,8 +47,9 @@ type Session struct {
 	// session, node shutdown).
 	turnCancel context.CancelFunc
 	// turnCancelCause records why the running turn is being ended; the
-	// cancel endpoint sets it to errTurnCancelled so the terminal event
-	// reads as turn_cancelled instead of error. Reset on every startTurn.
+	// cancel endpoint sets it to errTurnCancelled so the terminal
+	// turn_finished event carries the cancelled status instead of error.
+	// Reset on every startTurn.
 	turnCancelCause error
 	// turnDone is closed by finishTurn once the current turn has been
 	// marked finished; the cancel endpoint waits on it so a client can
@@ -271,8 +272,8 @@ func (s *Session) finishTurn() {
 }
 
 // cancelTurn aborts the running turn, if any (DELETE session, node
-// shutdown); the cause stays nil, so the turn still ends with an error
-// event rather than a turn_cancelled one.
+// shutdown); the cause stays nil, so the turn still ends with the error
+// status rather than cancelled.
 func (s *Session) cancelTurn() {
 	s.mu.Lock()
 	cancel := s.turnCancel

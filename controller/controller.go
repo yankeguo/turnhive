@@ -550,10 +550,11 @@ func buildBgExitMessage(exits []agent.BgProcessExit) string {
 
 // handleCancelTurn interrupts the session's running turn: the turn's
 // context is cancelled so the agent loop aborts (the partial reply is
-// persisted and an error event is published), and the handler returns
-// only once finishTurn has cleared the busy mark — so the client can
-// resend its message immediately to continue (resend is the recovery;
-// the cancelled turn is not replayed or resumable).
+// persisted and the turn closes with a turn_finished event carrying the
+// cancelled status), and the handler returns only once finishTurn has
+// cleared the busy mark — so the client can resend its message
+// immediately to continue (resend is the recovery; the cancelled turn
+// is not replayed or resumable).
 func (c *Controller) handleCancelTurn(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// No adoption: a cold session has no running turn, so cancelling one

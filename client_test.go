@@ -131,7 +131,7 @@ func serveEvents(w http.ResponseWriter) {
 	fmt.Fprint(w, "id: 1\nevent: turn_started\ndata: {\"turn_id\":\"turn-abc\"}\n\n")
 	fmt.Fprint(w, "id: 2\nevent: delta\ndata: {\"turn_id\":\"turn-abc\",\"text\":\"Hel\"}\n\n")
 	fmt.Fprint(w, "id: 3\nevent: tool_call\ndata: {\"turn_id\":\"turn-abc\",\"id\":\"c1\",\"name\":\"shell\",\"status\":\"running\"}\n\n")
-	fmt.Fprint(w, "id: 4\nevent: done\ndata: {\"turn_id\":\"turn-abc\",\"text\":\"Hello\"}\n")
+	fmt.Fprint(w, "id: 4\nevent: turn_finished\ndata: {\"turn_id\":\"turn-abc\",\"status\":\"done\",\"text\":\"Hello\"}\n")
 }
 
 func TestEventsStream(t *testing.T) {
@@ -166,7 +166,7 @@ func TestEventsStream(t *testing.T) {
 		{Type: EventTurnStarted, Seq: 1, TurnID: "turn-abc"},
 		{Type: EventDelta, Seq: 2, TurnID: "turn-abc", Text: "Hel"},
 		{Type: EventToolCall, Seq: 3, TurnID: "turn-abc", ID: "c1", Name: "shell", Status: ToolCallRunning},
-		{Type: EventDone, Seq: 4, TurnID: "turn-abc", Text: "Hello"},
+		{Type: EventTurnFinished, Seq: 4, TurnID: "turn-abc", Status: TurnStatusDone, Text: "Hello"},
 	}
 	if len(events) != len(want) {
 		t.Fatalf("got %d events, want %d: %+v", len(events), len(want), events)
@@ -201,7 +201,7 @@ func TestEventsResumePassesLastSeq(t *testing.T) {
 func TestEventsServerErrorEvent(t *testing.T) {
 	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "id: 7\nevent: error\ndata: {\"turn_id\":\"turn-abc\",\"message\":\"boom\"}\n\n")
+		fmt.Fprint(w, "id: 7\nevent: turn_finished\ndata: {\"turn_id\":\"turn-abc\",\"status\":\"error\",\"message\":\"boom\"}\n\n")
 	}))
 	defer done()
 
@@ -213,7 +213,7 @@ func TestEventsServerErrorEvent(t *testing.T) {
 	if !ok {
 		t.Fatal("stream closed without events")
 	}
-	if ev.Type != EventError || ev.Message != "boom" || ev.Seq != 7 || ev.TurnID != "turn-abc" {
+	if ev.Type != EventTurnFinished || ev.Status != TurnStatusError || ev.Message != "boom" || ev.Seq != 7 || ev.TurnID != "turn-abc" {
 		t.Fatalf("unexpected event: %+v", ev)
 	}
 	for range stream.Events() {

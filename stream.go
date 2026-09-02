@@ -35,14 +35,12 @@ const (
 	// EventToolCall reports a tool call starting or finishing; see
 	// Event.Status.
 	EventToolCall EventType = "tool_call"
-	// EventDone ends a successful turn; Event.Text is the full reply.
-	EventDone EventType = "done"
-	// EventError ends a failed turn; Event.Message describes the failure.
-	EventError EventType = "error"
-	// EventTurnCancelled ends a turn interrupted through the cancel
-	// endpoint (Event.TurnID) — a user-initiated interruption, not a
-	// failure.
-	EventTurnCancelled EventType = "turn_cancelled"
+	// EventTurnFinished ends a turn — the single terminal event of every
+	// turn, pairing with EventTurnStarted. Event.Status tells how the
+	// turn ended (see the TurnStatus constants): on TurnStatusDone
+	// Event.Text is the full reply, on TurnStatusError Event.Message
+	// describes the failure.
+	EventTurnFinished EventType = "turn_finished"
 )
 
 // Tool call statuses of an EventToolCall event.
@@ -50,6 +48,17 @@ const (
 	ToolCallRunning = "running"
 	ToolCallDone    = "done"
 	ToolCallError   = "error"
+)
+
+// Terminal statuses of an EventTurnFinished event.
+const (
+	// TurnStatusDone marks a successfully completed turn.
+	TurnStatusDone = "done"
+	// TurnStatusError marks a failed turn.
+	TurnStatusError = "error"
+	// TurnStatusCancelled marks a turn interrupted through the cancel
+	// endpoint — a user-initiated interruption, not a failure.
+	TurnStatusCancelled = "cancelled"
 )
 
 // Event is one event of the session event stream. The meaningful fields
@@ -60,12 +69,12 @@ type Event struct {
 	Type    EventType
 	Seq     int64
 	TurnID  string
-	Text    string // delta, reasoning_delta, done
+	Text    string // delta, reasoning_delta, turn_finished (TurnStatusDone)
 	ID      string // tool_call
 	Name    string // tool_call
 	Title   string // tool_call, optional
-	Status  string // tool_call: ToolCallRunning / ToolCallDone / ToolCallError
-	Message string // error
+	Status  string // tool_call: ToolCall*; turn_finished: TurnStatus*
+	Message string // turn_finished (TurnStatusError)
 	// Messages is the full merged history carried by the sync event
 	// (completed turns as {user, assistant} pairs); empty for all other
 	// event types.

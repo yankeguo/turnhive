@@ -462,7 +462,7 @@ func TestCancelTurnMarksCause(t *testing.T) {
 	sess.finishTurn()
 
 	// A new turn resets the cause; cancelTurn (DELETE/shutdown) leaves it
-	// nil, so the turn ends with an error event, not turn_cancelled.
+	// nil, so the turn ends with the error status, not cancelled.
 	sess.startTurn("turn-2", func() {})
 	sess.cancelTurn()
 	if sess.turnCause() != nil {

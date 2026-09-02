@@ -27,7 +27,7 @@ type hubEvent struct {
 // eventHub sequences, buffers and fans out the events of one session.
 // The buffer survives turn boundaries so a client reconnecting mid-turn
 // can replay; the hub tracks the running turn from the event stream
-// itself (turn_started opens it, done/error closes it).
+// itself (turn_started opens it, turn_finished closes it).
 type eventHub struct {
 	mu          sync.Mutex
 	seq         int64
@@ -59,7 +59,7 @@ func (h *eventHub) publish(turnID, name string, payload any) {
 	switch name {
 	case "turn_started":
 		h.currentTurn = turnID
-	case "done", "error", "turn_cancelled":
+	case "turn_finished":
 		h.currentTurn = ""
 	}
 	for ch := range h.subs {
@@ -114,6 +114,14 @@ func (h *eventHub) closeAll() {
 	h.mu.Unlock()
 }
 
+// Turn terminal statuses carried by the turn_finished event: one event
+// closes every turn, and its status says how.
+const (
+	turnStatusDone      = "done"
+	turnStatusError     = "error"
+	turnStatusCancelled = "cancelled"
+)
+
 // hubReporter implements agent.Reporter, publishing one session event
 // per call. Every payload carries the turn id so subscribers can
 // correlate events to turns.
@@ -142,16 +150,22 @@ func (r *hubReporter) ToolCall(ev agent.ToolCallEvent) {
 }
 
 func (r *hubReporter) Done(text string) {
-	r.hub.publish(r.turnID, "done", map[string]string{"turn_id": r.turnID, "text": text})
+	r.hub.publish(r.turnID, "turn_finished", map[string]string{
+		"turn_id": r.turnID, "status": turnStatusDone, "text": text,
+	})
 }
 
 func (r *hubReporter) Error(msg string) {
-	// A turn interrupted through the cancel endpoint ends with a distinct
-	// turn_cancelled event, so subscribers can tell it apart from a
-	// failure (timeout, stream error, ...).
+	// A turn interrupted through the cancel endpoint ends with the
+	// cancelled status, so subscribers can tell it apart from a failure
+	// (timeout, stream error, ...).
 	if r.cause != nil && errors.Is(r.cause(), errTurnCancelled) {
-		r.hub.publish(r.turnID, "turn_cancelled", map[string]string{"turn_id": r.turnID})
+		r.hub.publish(r.turnID, "turn_finished", map[string]string{
+			"turn_id": r.turnID, "status": turnStatusCancelled,
+		})
 		return
 	}
-	r.hub.publish(r.turnID, "error", map[string]string{"turn_id": r.turnID, "message": msg})
+	r.hub.publish(r.turnID, "turn_finished", map[string]string{
+		"turn_id": r.turnID, "status": turnStatusError, "message": msg,
+	})
 }

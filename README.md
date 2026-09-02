@@ -61,7 +61,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 
 ### 中断 turn
 
-`POST /v1/sessions/{id}/cancel` 中断当前进行中的 turn：其上下文被取消、部分回复落盘并通过 `turn_cancelled` 事件收尾（与失败区分开），返回 `202 {"turn_id":"...","status":"cancelled"}`（空闲时 `409 {"error":"no_turn_running"}`）。中断的 turn 不重放也不可恢复——客户端重新 `POST messages` 即视作恢复，之前已发出的 user 消息仍在历史中（write-ahead）。
+`POST /v1/sessions/{id}/cancel` 中断当前进行中的 turn：其上下文被取消、部分回复落盘并通过 `turn_finished` 事件（`status` 为 `cancelled`）收尾（与失败区分开），返回 `202 {"turn_id":"...","status":"cancelled"}`（空闲时 `409 {"error":"no_turn_running"}`）。中断的 turn 不重放也不可恢复——客户端重新 `POST messages` 即视作恢复，之前已发出的 user 消息仍在历史中（write-ahead）。
 
 ### session 事件流（SSE）
 
@@ -74,9 +74,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 | `delta` | `{"turn_id","text"}` | 模型输出增量 |
 | `reasoning_delta` | `{"turn_id","text"}` | 推理内容增量 |
 | `tool_call` | `{"turn_id","id","name","status"}` | 工具调用开始（`running`）/结束（`done`/`error`） |
-| `done` | `{"turn_id","text"}` | 本轮完成，text 为完整回复 |
-| `error` | `{"turn_id","message"}` | 本轮失败 |
-| `turn_cancelled` | `{"turn_id"}` | 本轮被 cancel 端点中断（用户主动中断，非失败） |
+| `turn_finished` | `{"turn_id","status","text"?,"message"?}` | 一个 turn 结束——每个 turn 的唯一收尾事件，与 `turn_started` 配对。`status`：`done`（成功，`text` 为完整回复）/ `error`（失败，`message` 为原因）/ `cancelled`（被 cancel 端点中断，用户主动中断，非失败） |
 
 ### 外部工具回报
 
@@ -117,7 +115,8 @@ turnID, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结
 
 stream, _ := cli.Events(ctx, sess.ID, 0) // 断线后用最后看到的 event.Seq 重连重放
 for event := range stream.Events() {
-    // event.Type: sync / turn_started / delta / reasoning_delta / tool_call / done / error
+    // event.Type: sync / turn_started / delta / reasoning_delta / tool_call / turn_finished
+    // turn_finished 的 event.Status: done（event.Text 为完整回复）/ error（event.Message 为原因）/ cancelled
     // 外部工具调用（event.Type == tool_call 且 status 为 running）执行后：
     //   cli.ReportToolResult(ctx, sess.ID, event.ID, result)
     //   或 cli.ReportToolError(ctx, sess.ID, event.ID, err)

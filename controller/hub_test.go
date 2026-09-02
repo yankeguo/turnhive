@@ -27,7 +27,7 @@ func TestHubPublishSubscribe(t *testing.T) {
 	if len(backlog) != 5 {
 		t.Fatalf("backlog = %d events, want 5", len(backlog))
 	}
-	names := []string{"turn_started", "delta", "delta", "tool_call", "done"}
+	names := []string{"turn_started", "delta", "delta", "tool_call", "turn_finished"}
 	for i, ev := range backlog {
 		if ev.name != names[i] || ev.seq != int64(i+1) {
 			t.Errorf("backlog[%d] = %s seq %d, want %s seq %d", i, ev.name, ev.seq, names[i], i+1)
@@ -133,36 +133,58 @@ func TestHubCloseAll(t *testing.T) {
 	}
 }
 
-func TestHubReporterCancelEndsTurnCancelled(t *testing.T) {
+func TestHubReporterTurnFinishedStatus(t *testing.T) {
 	h := newEventHub()
 	rep := &hubReporter{hub: h, turnID: "turn-1", cause: func() error { return errTurnCancelled }}
 	h.publish("turn-1", "turn_started", map[string]string{"turn_id": "turn-1"})
 	rep.Error("context canceled")
 
-	// The terminal event is turn_cancelled (not error), and it closes the
-	// hub's current-turn tracking like done/error would.
+	// The terminal event is turn_finished with the cancelled status (not
+	// error), and it closes the hub's current-turn tracking.
 	_, backlog, currentTurn, _ := h.subscribe(0)
 	if currentTurn != "" {
-		t.Fatalf("currentTurn = %q, want empty after turn_cancelled", currentTurn)
+		t.Fatalf("currentTurn = %q, want empty after turn_finished", currentTurn)
 	}
-	var last hubEvent
-	for _, ev := range backlog {
-		last = ev
+	last := backlog[len(backlog)-1]
+	if last.name != "turn_finished" {
+		t.Fatalf("last event = %q, want turn_finished", last.name)
 	}
-	if last.name != "turn_cancelled" {
-		t.Fatalf("last event = %q, want turn_cancelled", last.name)
+	var p struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(last.data, &p); err != nil || p.Status != turnStatusCancelled {
+		t.Fatalf("cancelled turn payload = %s, want status %q", last.data, turnStatusCancelled)
 	}
 
-	// A failure (nil cause) still ends with an error event.
+	// A failure (nil cause) ends with the error status and the message.
 	rep2 := &hubReporter{hub: h, turnID: "turn-2"}
 	h.publish("turn-2", "turn_started", map[string]string{"turn_id": "turn-2"})
 	rep2.Error("stream blew up")
 	_, backlog2, _, _ := h.subscribe(0)
-	var last2 hubEvent
-	for _, ev := range backlog2 {
-		last2 = ev
+	last2 := backlog2[len(backlog2)-1]
+	if last2.name != "turn_finished" {
+		t.Fatalf("last event = %q, want turn_finished", last2.name)
 	}
-	if last2.name != "error" {
-		t.Fatalf("last event = %q, want error", last2.name)
+	p = struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}{}
+	if err := json.Unmarshal(last2.data, &p); err != nil || p.Status != turnStatusError || p.Message != "stream blew up" {
+		t.Fatalf("failed turn payload = %s, want status %q with message", last2.data, turnStatusError)
+	}
+
+	// A successful turn ends with the done status and the full reply.
+	rep3 := &hubReporter{hub: h, turnID: "turn-3"}
+	h.publish("turn-3", "turn_started", map[string]string{"turn_id": "turn-3"})
+	rep3.Done("all good")
+	_, backlog3, _, _ := h.subscribe(0)
+	last3 := backlog3[len(backlog3)-1]
+	var p3 struct {
+		Status string `json:"status"`
+		Text   string `json:"text"`
+	}
+	if err := json.Unmarshal(last3.data, &p3); err != nil || p3.Status != turnStatusDone || p3.Text != "all good" {
+		t.Fatalf("done turn payload = %s, want status %q with text", last3.data, turnStatusDone)
 	}
 }
