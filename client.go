@@ -215,6 +215,10 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
 // those of later turns) are consumed from the session event stream —
 // see Events. A session runs one turn at a time; a concurrent turn is
 // rejected with ErrSessionBusy.
+//
+// Referencing attached files (AttachFiles) in a message is the caller's
+// business: compose whatever marker text you like into content — the
+// files are always at .agents/uploads/<name> inside the sandbox.
 func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (string, error) {
 	var resp struct {
 		TurnID string `json:"turn_id"`
@@ -226,6 +230,61 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (st
 		return "", err
 	}
 	return resp.TurnID, nil
+}
+
+// FileRef references one user-provided file stored in the cluster's
+// shared S3 bucket. The caller uploads the object to the bucket itself
+// and passes only its object key — turnhive never relays the bytes; the
+// sandbox downloads the object through a presigned URL.
+type FileRef struct {
+	// Name is the base file name inside the sandbox
+	// (".agents/uploads/<name>"); it must match
+	// ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ and be unique within the
+	// session (re-attaching a name replaces it).
+	Name string `json:"name"`
+	// ObjectKey is the S3 object key of the file, relative to the
+	// configured bucket prefix (same convention as SkillSpec.ObjectKey).
+	ObjectKey string `json:"object_key"`
+	// Size is the file size in bytes (informational).
+	Size int64 `json:"size,omitempty"`
+}
+
+// AttachFiles registers user-provided files on the session. Attached
+// files are injected into the sandbox (immediately when one is live,
+// otherwise on its next build) under .agents/uploads/<name>, are
+// recorded as session state (carried by the sync event, see
+// Event.Files, and by GetSession) and survive sandbox rebuilds and node
+// failovers. How and when a message references them is entirely up to
+// the caller (see SendMessage).
+func (c *Client) AttachFiles(ctx context.Context, sessionID string, files []FileRef) error {
+	body := struct {
+		Files []FileRef `json:"files"`
+	}{Files: files}
+	return c.do(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(sessionID)+"/files", body, nil)
+}
+
+// SessionDetail is the session state reported by GetSession, for
+// inspection, statistics and audit tooling.
+type SessionDetail struct {
+	// ID is the session id.
+	ID string `json:"id"`
+	// TurnID is the currently running turn ("" when idle).
+	TurnID string `json:"turn_id"`
+	// Files are the user-provided files attached to the session.
+	Files []UploadRecord `json:"files"`
+	// Persisted are the files the session persisted via the persist
+	// tool.
+	Persisted []PersistedObject `json:"persisted"`
+}
+
+// GetSession returns the session's details. A missing session reports
+// ErrSessionNotFound.
+func (c *Client) GetSession(ctx context.Context, sessionID string) (SessionDetail, error) {
+	var d SessionDetail
+	if err := c.do(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID), nil, &d); err != nil {
+		return SessionDetail{}, err
+	}
+	return d, nil
 }
 
 // CancelTurn interrupts the session's running turn and returns its id.

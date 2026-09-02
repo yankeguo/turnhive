@@ -31,7 +31,7 @@ func TestProxyRejectsInvalidAddress(t *testing.T) {
 
 func TestWriteSSESyncHasNoFrameID(t *testing.T) {
 	var buf bytes.Buffer
-	writeSSESync(&buf, "turn-1", 7, []syncMessage{{Role: "user", Content: "hi"}}, nil)
+	writeSSESync(&buf, "turn-1", 7, []syncMessage{{Role: "user", Content: "hi"}}, nil, nil)
 	out := buf.String()
 	// A control frame must not occupy an event sequence number; the seq
 	// lives in the payload only.

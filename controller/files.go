@@ -1,0 +1,186 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/yankeguo/turnhive/agent"
+	"github.com/yankeguo/turnhive/storage"
+)
+
+// uploadsNameCountCap bounds how many distinct files one session
+// carries, so the manifest and the sync frame stay small.
+const uploadsNameCountCap = 64
+
+// filesInjectTimeout bounds the injection of newly attached files into a
+// live sandbox.
+const filesInjectTimeout = 30 * time.Second
+
+// filesManifestObjectKey is the S3 object key of a session's files
+// manifest: the durable copy of its user-provided files, loaded on
+// adoption. It lives next to the history (and survives DELETE, like the
+// persisted files), not inside the spec — files are attached over the
+// session's life, not fixed at creation.
+func filesManifestObjectKey(sessionID string) string {
+	return "sessions/" + sessionID + "/files.json"
+}
+
+// writeFilesManifest persists the session's files manifest.
+func writeFilesManifest(ctx context.Context, s adoptionStore, sessionID string, uploads []agent.UploadRecord) error {
+	data, err := json.Marshal(uploads)
+	if err != nil {
+		return fmt.Errorf("marshal files manifest: %w", err)
+	}
+	if err = s.PutObject(ctx, filesManifestObjectKey(sessionID), data); err != nil {
+		return fmt.Errorf("write files manifest: %w", err)
+	}
+	return nil
+}
+
+// loadFilesManifest reads a session's files manifest; a missing manifest
+// is an empty set, not an error (sessions created before files existed,
+// or that never received one).
+func loadFilesManifest(ctx context.Context, s adoptionStore, sessionID string) (map[string]agent.UploadRecord, error) {
+	data, err := s.GetObject(ctx, filesManifestObjectKey(sessionID))
+	if errors.Is(err, storage.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var uploads []agent.UploadRecord
+	if err = json.Unmarshal(data, &uploads); err != nil {
+		return nil, fmt.Errorf("parse files manifest: %w", err)
+	}
+	out := make(map[string]agent.UploadRecord, len(uploads))
+	for _, u := range uploads {
+		out[u.Name] = u
+	}
+	return out, nil
+}
+
+// AddFilesRequest is the JSON body of POST /v1/sessions/{id}/files.
+type AddFilesRequest struct {
+	// Files are the user-provided files to attach; each is an object key
+	// in the shared S3 bucket (the caller puts the object itself).
+	Files []FileRef `json:"files"`
+}
+
+// handleCreateFiles attaches user-provided files to the session: the
+// records join the session state (and the persisted manifest, so an
+// adopted session restores them) and are injected into the sandbox —
+// immediately when a live sandbox exists, otherwise on the next sandbox
+// build (ensureSandbox injects the full set).
+func (c *Controller) handleCreateFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	var req AddFilesRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body: " + err.Error()})
+		return
+	}
+	if len(req.Files) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "files is required"})
+		return
+	}
+	if err := validateFileRefs(req.Files); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		// Lost a race with DELETE after routeSession.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := v.(*Session)
+
+	records := make([]agent.UploadRecord, 0, len(req.Files))
+	for _, f := range req.Files {
+		records = append(records, agent.UploadRecord{
+			Name:      f.Name,
+			ObjectKey: f.ObjectKey,
+			Size:      f.Size,
+			At:        time.Now().UTC(),
+		})
+	}
+
+	// A live sandbox gets the files right away, so a message sent after
+	// this call always finds them on disk; a cold session (sandbox
+	// reaped) simply relies on the next build, which injects every
+	// recorded upload.
+	if sb, ok := sess.liveSandbox(); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), filesInjectTimeout)
+		err := agent.InjectUploads(ctx, sb, c.store, records, agent.UploadURLTTL)
+		cancel()
+		if err != nil {
+			log.Printf("session %s: inject files: %v", id, err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to inject files into the sandbox"})
+			return
+		}
+	}
+
+	for _, u := range records {
+		sess.recordUpload(u)
+	}
+	if len(sess.Uploads()) > uploadsNameCountCap {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": fmt.Sprintf("too many files (limit %d)", uploadsNameCountCap)})
+		return
+	}
+
+	// Persist the manifest so adoption restores the files. Best-effort
+	// like history saves: the in-memory state is authoritative, and a
+	// failed write only degrades crash recovery (logged).
+	if c.store != nil {
+		if err := writeFilesManifest(r.Context(), c.store, id, sess.Uploads()); err != nil {
+			log.Printf("session %s: write files manifest: %v", id, err)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+// SessionDetail is the response body of GET /v1/sessions/{id}: the
+// session's state for inspection, statistics and audit purposes.
+type SessionDetail struct {
+	// ID is the session id.
+	ID string `json:"id"`
+	// TurnID is the currently running turn ("" when idle).
+	TurnID string `json:"turn_id"`
+	// Files are the user-provided files attached to the session.
+	Files []agent.UploadRecord `json:"files"`
+	// Persisted are the files the session persisted via the persist
+	// tool.
+	Persisted []agent.PersistedObject `json:"persisted"`
+}
+
+// handleGetSession reports the session's details (files, persisted
+// objects, running turn) for inspection and audit tooling. It adopts
+// cold sessions like any other session-scoped route.
+func (c *Controller) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !c.routeSession(w, r, id) {
+		return
+	}
+	v, ok := c.sessions.Load(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := v.(*Session)
+	writeJSON(w, http.StatusOK, SessionDetail{
+		ID:        id,
+		TurnID:    sess.TurnID(),
+		Files:     sess.Uploads(),
+		Persisted: sess.Persisted(),
+	})
+}

@@ -399,3 +399,68 @@ func TestStreamCloseUnblocksProducer(t *testing.T) {
 		}
 	}
 }
+
+func TestAttachFiles(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/sessions/s1/files" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		var req struct {
+			Files []FileRef `json:"files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		if len(req.Files) != 1 || req.Files[0].Name != "data.csv" || req.Files[0].ObjectKey != "uploads/s1/t-data.csv" || req.Files[0].Size != 7 {
+			t.Errorf("unexpected files: %+v", req.Files)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer done()
+
+	err := cli.AttachFiles(context.Background(), "s1", []FileRef{{Name: "data.csv", ObjectKey: "uploads/s1/t-data.csv", Size: 7}})
+	if err != nil {
+		t.Fatalf("attach files: %v", err)
+	}
+}
+
+func TestEventsSyncCarriesFiles(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: sync\ndata: {\"turn_id\":\"\",\"seq\":0,\"messages\":[],\"persisted\":[],\"files\":[{\"name\":\"data.csv\",\"object_key\":\"uploads/s1/t-data.csv\",\"size\":7,\"at\":\"2026-09-03T01:00:00Z\"}]}\n\n")
+	}))
+	defer done()
+
+	stream, err := cli.Events(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	defer stream.Close()
+	ev, ok := <-stream.Events()
+	if !ok {
+		t.Fatal("no event")
+	}
+	if ev.Type != EventSync || len(ev.Files) != 1 || ev.Files[0].Name != "data.csv" || ev.Files[0].ObjectKey != "uploads/s1/t-data.csv" || ev.Files[0].Size != 7 {
+		t.Fatalf("sync event: %+v", ev)
+	}
+}
+
+func TestGetSession(t *testing.T) {
+	cli, done := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/sessions/s1" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"id":"s1","turn_id":"turn-x","files":[{"name":"data.csv","object_key":"uploads/s1/t-data.csv","size":7,"at":"2026-09-03T01:00:00Z"}],"persisted":[{"path":"out.txt","object_key":"sessions/s1/persisted/out.txt","size":3,"at":"2026-09-03T02:00:00Z"}]}`))
+	}))
+	defer done()
+
+	d, err := cli.GetSession(context.Background(), "s1")
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if d.ID != "s1" || d.TurnID != "turn-x" || len(d.Files) != 1 || d.Files[0].Name != "data.csv" || len(d.Persisted) != 1 || d.Persisted[0].Path != "out.txt" {
+		t.Fatalf("detail: %+v", d)
+	}
+}

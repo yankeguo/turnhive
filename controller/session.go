@@ -68,6 +68,10 @@ type Session struct {
 	// persisted records every file the persist tool stored, keyed by
 	// in-sandbox path (re-persisting a path replaces the entry).
 	persisted map[string]agent.PersistedObject
+	// uploads records every user-provided file (an object key in the
+	// shared bucket), keyed by in-sandbox name; it is mirrored into
+	// Spec.Files so adoption restores it.
+	uploads map[string]agent.UploadRecord
 	// bgExited holds background-process exits waiting to be reported as
 	// a synthesized user turn once the session is idle.
 	bgExited []agent.BgProcessExit
@@ -85,6 +89,17 @@ func (s *Session) hasSandbox() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sandbox != nil
+}
+
+// liveSandbox returns the session's current sandbox, or false when the
+// session is closed or its sandbox was reaped.
+func (s *Session) liveSandbox() (*ironhive.Sandbox, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.sandbox == nil {
+		return nil, false
+	}
+	return s.sandbox, true
 }
 
 // setSandbox installs a freshly built sandbox and its lease-renewal
@@ -199,6 +214,29 @@ func (s *Session) Persisted() []agent.PersistedObject {
 		out = append(out, obj)
 	}
 	slices.SortFunc(out, func(a, b agent.PersistedObject) int { return strings.Compare(a.Path, b.Path) })
+	return out
+}
+
+// recordUpload records a user-provided file as session state, keyed by
+// in-sandbox name (re-attaching a name replaces the entry).
+func (s *Session) recordUpload(u agent.UploadRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.uploads == nil {
+		s.uploads = make(map[string]agent.UploadRecord)
+	}
+	s.uploads[u.Name] = u
+}
+
+// Uploads returns the session's user-provided files, sorted by name.
+func (s *Session) Uploads() []agent.UploadRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]agent.UploadRecord, 0, len(s.uploads))
+	for _, u := range s.uploads {
+		out = append(out, u)
+	}
+	slices.SortFunc(out, func(a, b agent.UploadRecord) int { return strings.Compare(a.Name, b.Name) })
 	return out
 }
 
@@ -383,6 +421,22 @@ type CreateSessionRequest struct {
 	Tools      []ToolSpec      `json:"tools"`
 }
 
+// FileRef references one user-provided file stored in the shared S3
+// bucket. The caller puts the object itself; turnhive only ever moves
+// the bytes between the bucket and the sandbox (via presigned URLs).
+type FileRef struct {
+	// Name is the base file name inside the sandbox
+	// (".agents/uploads/<name>"); it must match
+	// agent.UploadFileNamePattern and be unique within the session.
+	Name string `json:"name"`
+	// ObjectKey is the S3 object key of the file, relative to the
+	// configured bucket prefix (same convention as SkillSpec.ObjectKey).
+	ObjectKey string `json:"object_key"`
+	// Size is the file size in bytes as declared by the caller
+	// (informational).
+	Size int64 `json:"size,omitempty"`
+}
+
 // ModelSpec describes the LLM inference endpoint used by the session.
 type ModelSpec struct {
 	// URL is the full inference endpoint URL.
@@ -555,6 +609,31 @@ func (r *CreateSessionRequest) Validate() error {
 		}
 		if t.Parameters == nil {
 			return fmt.Errorf("tools[%d].parameters is required (use {} for a tool without arguments)", i)
+		}
+	}
+	return nil
+}
+
+// validateFileRefs checks a files list (create-session spec or files
+// endpoint body).
+func validateFileRefs(files []FileRef) error {
+	seen := make(map[string]bool, len(files))
+	for i, f := range files {
+		if !agent.UploadFileNamePattern.MatchString(f.Name) {
+			return fmt.Errorf("files[%d].name must match %s (a plain base name, no path components)", i, agent.UploadFileNamePattern)
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("files[%d].name %q duplicates an earlier file", i, f.Name)
+		}
+		seen[f.Name] = true
+		if strings.TrimSpace(f.ObjectKey) == "" {
+			return fmt.Errorf("files[%d].object_key is required", i)
+		}
+		if strings.Contains(f.ObjectKey, "..") {
+			return fmt.Errorf("files[%d].object_key must not contain \"..\"", i)
+		}
+		if f.Size < 0 {
+			return fmt.Errorf("files[%d].size must not be negative", i)
 		}
 	}
 	return nil

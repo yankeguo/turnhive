@@ -82,6 +82,9 @@ type Event struct {
 	// Persisted lists the files the session has stored to object storage
 	// via the persist tool; only set on the sync event.
 	Persisted []PersistedObject
+	// Files lists the user-provided files attached to the session
+	// (Client.AttachFiles); only set on the sync event.
+	Files []UploadRecord
 }
 
 // SyncMessage is one message of the merged history in a sync event.
@@ -100,6 +103,16 @@ type PersistedObject struct {
 	At        time.Time `json:"at"`
 }
 
+// UploadRecord records one user-provided file attached to the session
+// (Client.AttachFiles): an object key in the shared bucket, injected
+// into the sandbox at .agents/uploads/<name>.
+type UploadRecord struct {
+	Name      string    `json:"name"`
+	ObjectKey string    `json:"object_key"`
+	Size      int64     `json:"size,omitempty"`
+	At        time.Time `json:"at"`
+}
+
 // eventPayload is the JSON data carried by one SSE event; every event
 // kind decodes from the same flat shape.
 type eventPayload struct {
@@ -113,6 +126,7 @@ type eventPayload struct {
 	Message   string            `json:"message"`
 	Messages  []SyncMessage     `json:"messages"`
 	Persisted []PersistedObject `json:"persisted"`
+	Files     []UploadRecord    `json:"files"`
 }
 
 // Stream is the session-level event stream returned by Client.Events. It
@@ -212,6 +226,7 @@ func (s *Stream) run() {
 			Message:   p.Message,
 			Messages:  p.Messages,
 			Persisted: p.Persisted,
+			Files:     p.Files,
 		}:
 			return true
 		case <-s.done:

@@ -110,7 +110,11 @@ func loadAdoptableSession(ctx context.Context, s adoptionStore, id string) (sess
 	if err != nil {
 		return nil, false, fmt.Errorf("list persisted files: %w", err)
 	}
-	sess = &Session{ID: id, Spec: spec, hub: newEventHub(), persisted: persisted}
+	uploads, err := loadFilesManifest(ctx, s, id)
+	if err != nil {
+		return nil, false, fmt.Errorf("load files manifest: %w", err)
+	}
+	sess = &Session{ID: id, Spec: spec, hub: newEventHub(), persisted: persisted, uploads: uploads}
 	sess.touch()
 	return sess, true, nil
 }

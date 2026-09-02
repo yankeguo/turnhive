@@ -220,6 +220,8 @@ func (c *Controller) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sessions/{id}/cancel", c.handleCancelTurn)
 	mux.HandleFunc("GET /v1/sessions/{id}/events", c.handleSessionEvents)
 	mux.HandleFunc("POST /v1/sessions/{id}/tool_results", c.handleCreateToolResult)
+	mux.HandleFunc("POST /v1/sessions/{id}/files", c.handleCreateFiles)
+	mux.HandleFunc("GET /v1/sessions/{id}", c.handleGetSession)
 	mux.HandleFunc("DELETE /v1/sessions/{id}", c.handleDeleteSession)
 }
 
@@ -372,6 +374,10 @@ func (c *Controller) ensureSandbox(ctx context.Context, sess *Session) error {
 		releaseSandbox(sandbox)
 		return fmt.Errorf("restore persisted files: %w", err)
 	}
+	if err = agent.InjectUploads(ctx, sandbox, c.store, sess.Uploads(), skillURLTTL); err != nil {
+		releaseSandbox(sandbox)
+		return fmt.Errorf("inject user files: %w", err)
+	}
 	l := c.buildLoop(sess, sandbox)
 	if err = l.LoadHistory(ctx); err != nil {
 		releaseSandbox(sandbox)
@@ -419,7 +425,10 @@ func (c *Controller) renewSandbox(ctx context.Context, sb *ironhive.Sandbox) {
 
 // CreateMessageRequest is the JSON body of POST /v1/sessions/{id}/messages.
 type CreateMessageRequest struct {
-	// Content is the user input for this turn.
+	// Content is the user input for this turn. Referencing attached
+	// files (POST .../files) is the caller's business: it composes
+	// whatever marker text it likes — the files are always at
+	// .agents/uploads/<name> inside the sandbox.
 	Content string `json:"content"`
 }
 
@@ -639,7 +648,7 @@ func (c *Controller) handleSessionEvents(w http.ResponseWriter, r *http.Request)
 	for _, m := range history {
 		messages = append(messages, syncMessage{Role: m.Role, Content: m.Content})
 	}
-	writeSSESync(w, currentTurn, latest, messages, sess.Persisted())
+	writeSSESync(w, currentTurn, latest, messages, sess.Persisted(), sess.Uploads())
 	for _, ev := range backlog {
 		writeSSEFrame(w, ev)
 	}

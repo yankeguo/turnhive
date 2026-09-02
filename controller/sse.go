@@ -41,13 +41,14 @@ type syncMessage struct {
 // frame that does not occupy an event sequence number, and an id would
 // make EventSource record a stale Last-Event-ID, replaying already
 // received frames on reconnect (clients take the seq from the payload).
-func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []syncMessage, persisted []agent.PersistedObject) {
+func writeSSESync(w io.Writer, currentTurn string, latestSeq int64, messages []syncMessage, persisted []agent.PersistedObject, files []agent.UploadRecord) {
 	payload, err := json.Marshal(struct {
 		TurnID    string                  `json:"turn_id"`
 		Seq       int64                   `json:"seq"`
 		Messages  []syncMessage           `json:"messages"`
 		Persisted []agent.PersistedObject `json:"persisted"`
-	}{TurnID: currentTurn, Seq: latestSeq, Messages: messages, Persisted: persisted})
+		Files     []agent.UploadRecord    `json:"files"`
+	}{TurnID: currentTurn, Seq: latestSeq, Messages: messages, Persisted: persisted, Files: files})
 	if err != nil {
 		return
 	}

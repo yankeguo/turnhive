@@ -17,7 +17,9 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 | 接口 | 说明 |
 | --- | --- |
 | `POST /v1/sessions` | 创建 session，返回 session ID |
+| `GET /v1/sessions/{id}` | 查询 session 明细（附加文件、持久化对象、运行中 turn），供统计/审计 |
 | `POST /v1/sessions/{id}/messages` | 向 session 发送输入，异步受理，返回 turn ID |
+| `POST /v1/sessions/{id}/files` | 为 session 附加用户文件（共享 bucket 中的 object_key），任意时刻可调用 |
 | `POST /v1/sessions/{id}/cancel` | 中断当前进行中的 turn（空闲时返回 409 `no_turn_running`）；恢复 = 重新发送消息 |
 | `GET /v1/sessions/{id}/events` | session 事件流（SSE）：所有 turn 的输出都经此通道下发 |
 | `POST /v1/sessions/{id}/tool_results` | 回报外部工具的执行结果 |
@@ -55,9 +57,28 @@ turnhive 对外只暴露极简的 Session API：客户端**创建 session**，�
 
 `POST /v1/sessions/{id}/messages`，body `{"content": "..."}`。turn 在集群内部异步执行，响应为 `202 {"turn_id": "turn-..."}`；turn 的全部输出经事件流（见下）下发。客户端断开此请求不会中断 turn。
 
+消息中引用已附加的文件由调用方自行组织：文件固定位于沙箱 `./.agents/uploads/<name>`，调用方以任意格式、任意时机把指向文件的 marker 文本写进 `content` 即可——turnhive 不规定 marker 格式。
+
 session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error":"session_busy"}`。
 
 所有 JSON 请求体的上限为 4MB，超限返回 400。
+
+### 附加用户文件
+
+用户可能随时上传文件。turnhive 与调用方共享同一个 S3 bucket，文件传递一律以 **object_key** 形式进行，turnhive 不中转字节：调用方收到用户文件后自行 PUT 到 bucket，然后在任意时刻 `POST /v1/sessions/{id}/files` 登记：
+
+```jsonc
+{"files": [{"name": "data.csv", "object_key": "uploads/sess-xxx/abc-data.csv", "size": 12345}]}
+```
+
+- `name` 须匹配 `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`（纯文件名，不含路径），在 session 内唯一（同名重复登记会覆盖）；每个 session 最多 64 个文件
+- 登记后文件会被注入沙箱 `./.agents/uploads/<name>`：有活沙箱时立即注入（沙箱经 presigned URL 自行从 S3 拉取），否则下次沙箱构建时随 skills/persisted 一起注入
+- 文件清单作为 session 状态持久化到 `sessions/{id}/files.json`：沙箱 idle 回收重建、节点崩溃收养、冷换出复活后，文件都会恢复到新沙箱；同时随事件流 `sync` 帧的 `files` 字段下发
+- 删除文件不提供接口：同名重新登记即替换；沙箱是一次性的，旧文件随沙箱销毁消失
+
+### 查询 session 明细（统计/审计）
+
+`GET /v1/sessions/{id}` 返回 `200 {"id", "turn_id", "files", "persisted"}`：附加的用户文件列表、persist 工具写入的持久化对象列表、当前运行中的 turn（空闲为 ""）。冷 session 会经 adopt 路径恢复后返回，不存在的 session 返回 404。
 
 ### 中断 turn
 
@@ -69,7 +90,7 @@ session 同时只允许一个进行中的 turn，并发请求返回 `409 {"error
 
 | 事件 | 数据 | 说明 |
 | --- | --- | --- |
-| `sync` | `{"turn_id","seq","messages","persisted"}` | 连接后的首帧：当前 turn（空闲为 ""）、最新序号、合并后的全部历史消息（{user, assistant} 对），以及 session 已持久化的对象列表（persist 工具写入）——客户端凭此一帧完成同步 |
+| `sync` | `{"turn_id","seq","messages","persisted","files"}` | 连接后的首帧：当前 turn（空闲为 ""）、最新序号、合并后的全部历史消息（{user, assistant} 对）、session 已持久化的对象列表（persist 工具写入）以及用户附加的文件列表（`files`）——客户端凭此一帧完成同步 |
 | `turn_started` | `{"turn_id"}` | 一个 turn 开始 |
 | `delta` | `{"turn_id","text"}` | 模型输出增量 |
 | `reasoning_delta` | `{"turn_id","text"}` | 推理内容增量 |
@@ -92,6 +113,7 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 
 - 大模型调用（OpenAI-compatible 流式端点；429 限流响应按 `Retry-After` 退避重试，最多 3 次，未带 `Retry-After` 时指数退避——仅在响应建立前重试，流式开始后绝不重试）
 - 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）；persist（把沙盒文件转存到 S3 `sessions/{id}/persisted/` 并记录为 session 属性，随 sync 帧下发）
+- 用户文件注入：`POST .../files` 登记的文件（共享 bucket 的 object_key）在沙箱创建/重建时经 presigned URL 注入 `./.agents/uploads/<name>`，清单持久化到 `sessions/{id}/files.json` 并随 sync 帧下发——与 persist 对称：persist 是沙箱→S3 的中间/最终产物保存，files 是 S3→沙箱的用户输入
 - 上下文窗口管理（`model.max_context` 驱动）：每个 turn 前按估算整轮丢弃最旧历史（保留最近 turn 与回复预算），turn 用量超 0.8×窗口后把旧 turn 压缩为结构化 `<context-summary>` 摘要（保留最近 2 轮原文）
 - MCP 工具接入：`mcp_servers[]` 声明的 server 在每个 turn 开始时现场连接（单 server 连接+列工具 10s 上限），其工具以 `{name}__{tool}` 命名空间挂载、仅本 turn 有效，turn 结束全部断开；单个 server 失败只记日志，不拖垮其他 server 与 turn。`transport` 可选 `"streamable"` / `"sse"`，缺省 auto（先试 streamable HTTP，连接失败回退 legacy SSE）；不支持 stdio。`name` 须匹配 `^[a-zA-Z0-9_-]{1,32}$` 且在 `mcp_servers` 内唯一
 - 出口调用标识：每次 LLM 请求与每个 MCP 连接固定携带 `X-Turnhive-Session: <session-id>` 头（覆盖 spec 中的同名头，防冒名）。上游网关可据此反推 session 归属做门控与计费归因（内网信任）；不做门控的上游直接忽略该头即可——turnhive 也可以脱离网关直连 provider / MCP server
@@ -112,6 +134,17 @@ sess, _ := cli.CreateSession(ctx, turnhive.CreateSessionRequest{ /* ... */ })
 defer cli.DeleteSession(ctx, sess.ID)
 
 turnID, _ := cli.SendMessage(ctx, sess.ID, "帮我分析这个仓库的代码结构")
+
+// 附带用户文件：调用方先把文件 PUT 到共享 bucket 得到 object_key，再在任意
+// 时刻登记到 session；消息中如何引用（marker 格式与时机）由调用方自行组织，
+// 文件固定位于沙箱 ./.agents/uploads/<name>
+_ = cli.AttachFiles(ctx, sess.ID, []turnhive.FileRef{{Name: "data.csv", ObjectKey: "uploads/sess-xxx/abc-data.csv", Size: 12345}})
+turnID2, _ := cli.SendMessage(ctx, sess.ID, "分析 ./.agents/uploads/data.csv 这份数据")
+_ = turnID2
+
+// 统计/审计：查询 session 明细
+detail, _ := cli.GetSession(ctx, sess.ID) // detail.Files / detail.Persisted / detail.TurnID
+_ = detail
 
 stream, _ := cli.Events(ctx, sess.ID, 0) // 断线后用最后看到的 event.Seq 重连重放
 for event := range stream.Events() {
