@@ -914,3 +914,47 @@ func TestLoopSealInterruptedTurn(t *testing.T) {
 		t.Fatalf("no save expected for a paired history, got %d", len(hist2.saved))
 	}
 }
+
+func TestLoopSessionHeader(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("ok")
+	l := newTestLoop(LoopConfig{
+		ModelName: "test-model",
+		ModelHeaders: map[string]string{
+			"Authorization": "Bearer k",
+			// A spec header shadowing the fixed session header (any
+			// case) must be dropped, not sent alongside it.
+			"x-turnhive-session": "sess-spoofed",
+		},
+		SessionID: "sess-1",
+	}, fs)
+	if err := l.RunTurn(context.Background(), "hi", &fakeReporter{}); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	req := fs.lastRequest()
+	if got := req.Headers[SessionHeader]; got != "sess-1" {
+		t.Fatalf("session header = %q, want sess-1", got)
+	}
+	for k := range req.Headers {
+		if k != SessionHeader && strings.EqualFold(k, SessionHeader) {
+			t.Fatalf("spec-supplied session header variant survived: %q", k)
+		}
+	}
+	if got := req.Headers["Authorization"]; got != "Bearer k" {
+		t.Fatalf("spec headers must be preserved, Authorization = %q", got)
+	}
+}
+
+func TestWithSessionHeader(t *testing.T) {
+	// An empty session id leaves the headers untouched (and shares the
+	// map — callers must not mutate the result in that case).
+	in := map[string]string{"Authorization": "Bearer k"}
+	if got := withSessionHeader(in, ""); got[SessionHeader] != "" || got["Authorization"] != "Bearer k" {
+		t.Fatalf("empty id must not inject the header, got %+v", got)
+	}
+	// The input map is never mutated.
+	_ = withSessionHeader(in, "sess-9")
+	if _, ok := in[SessionHeader]; ok {
+		t.Fatalf("input map mutated: %+v", in)
+	}
+}

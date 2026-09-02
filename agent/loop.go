@@ -20,12 +20,37 @@ var ErrBusy = errors.New("agent: a turn is already running")
 // with tool calls counts as one step.
 const maxTurnSteps = 199
 
+// SessionHeader is the fixed header carrying the session ID on every
+// upstream LLM request and MCP connection. An upstream gateway can
+// resolve the session to a user and gate the call (intranet trust), or
+// ignore it entirely and let turnhive call providers directly.
+const SessionHeader = "X-Turnhive-Session"
+
+// withSessionHeader returns headers with the fixed session header set to
+// id. Any same-named entry in the spec headers (case-insensitive) is
+// dropped first, so a session spec cannot impersonate another session.
+func withSessionHeader(headers map[string]string, id string) map[string]string {
+	if id == "" {
+		return headers
+	}
+	merged := make(map[string]string, len(headers)+1)
+	for k, v := range headers {
+		if strings.EqualFold(k, SessionHeader) {
+			continue
+		}
+		merged[k] = v
+	}
+	merged[SessionHeader] = id
+	return merged
+}
+
 // LoopConfig configures a Loop.
 type LoopConfig struct {
 	// ModelURL is the full OpenAI-compatible chat completion endpoint URL.
 	ModelURL string
 	// ModelHeaders carries the authentication header and any extra
-	// headers sent to the endpoint.
+	// headers sent to the endpoint. The fixed session header
+	// (SessionHeader) is added on top and cannot be overridden here.
 	ModelHeaders map[string]string
 	// ModelName is the model name.
 	ModelName string
@@ -40,8 +65,9 @@ type LoopConfig struct {
 	// PersistStore enables the persist tool (requires Sandbox): files are
 	// uploaded to it under sessions/{SessionID}/persisted/.
 	PersistStore PersistStore
-	// SessionID scopes the persist tool's object keys; required when
-	// PersistStore is set.
+	// SessionID scopes the persist tool's object keys (required when
+	// PersistStore is set) and is sent upstream as the fixed session
+	// header (SessionHeader) on every LLM request and MCP connection.
 	SessionID string
 	// OnPersisted is called after the persist tool stores a file, so the
 	// caller can record it as session state.
@@ -59,7 +85,8 @@ type LoopConfig struct {
 	// MCPServers are connected at the start of every turn; their tools
 	// are mounted namespaced as "{name}__{tool}" and live only for that
 	// turn. A server that fails to connect is skipped — the turn
-	// proceeds without its tools.
+	// proceeds without its tools. Every connection carries the fixed
+	// session header (SessionHeader) on top of the spec headers.
 	MCPServers []MCPServerSpec
 	// OnMCPStatus is called once per configured MCP server at the start
 	// of every turn with the connection result; nil disables reporting.
@@ -107,7 +134,12 @@ func NewLoop(cfg LoopConfig) *Loop {
 	l.toolDefs = toolSpecs(l.tools)
 	if len(cfg.MCPServers) > 0 {
 		l.mcpConnect = func(ctx context.Context) ([]Tool, func()) {
-			return ConnectMCPServers(ctx, cfg.MCPServers, cfg.OnMCPStatus)
+			specs := make([]MCPServerSpec, len(cfg.MCPServers))
+			for i, s := range cfg.MCPServers {
+				s.Headers = withSessionHeader(s.Headers, cfg.SessionID)
+				specs[i] = s
+			}
+			return ConnectMCPServers(ctx, specs, cfg.OnMCPStatus)
 		}
 	}
 	return l
@@ -206,7 +238,7 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		stepText.Reset()
 		msg, usage, err := l.stream(ctx, llm.Request{
 			URL:      l.cfg.ModelURL,
-			Headers:  l.cfg.ModelHeaders,
+			Headers:  withSessionHeader(l.cfg.ModelHeaders, l.cfg.SessionID),
 			Model:    l.cfg.ModelName,
 			Messages: working,
 			Tools:    toolDefs,

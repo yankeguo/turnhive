@@ -94,10 +94,10 @@ Agent 调用 `tools[]` 中声明的外部工具时，SSE 会发出 `tool_call` �
 - 沙箱内工具：read / write / edit / apply_patch / shell（全部经 ironhive 沙箱执行）；`model.features` 含 `support_image` 时额外启用 load_media（沙箱图片注入上下文供视觉分析）；persist（把沙盒文件转存到 S3 `sessions/{id}/persisted/` 并记录为 session 属性，随 sync 帧下发）
 - 上下文窗口管理（`model.max_context` 驱动）：每个 turn 前按估算整轮丢弃最旧历史（保留最近 turn 与回复预算），turn 用量超 0.8×窗口后把旧 turn 压缩为结构化 `<context-summary>` 摘要（保留最近 2 轮原文）
 - MCP 工具接入：`mcp_servers[]` 声明的 server 在每个 turn 开始时现场连接（单 server 连接+列工具 10s 上限），其工具以 `{name}__{tool}` 命名空间挂载、仅本 turn 有效，turn 结束全部断开；单个 server 失败只记日志，不拖垮其他 server 与 turn。`transport` 可选 `"streamable"` / `"sse"`，缺省 auto（先试 streamable HTTP，连接失败回退 legacy SSE）；不支持 stdio。`name` 须匹配 `^[a-zA-Z0-9_-]{1,32}$` 且在 `mcp_servers` 内唯一
+- 出口调用标识：每次 LLM 请求与每个 MCP 连接固定携带 `X-Turnhive-Session: <session-id>` 头（覆盖 spec 中的同名头，防冒名）。上游网关可据此反推 session 归属做门控与计费归因（内网信任）；不做门控的上游直接忽略该头即可——turnhive 也可以脱离网关直连 provider / MCP server
 - session 无限恢复：沙盒空闲超 `session.idle_timeout` 被回收但 session 不销毁；下一条消息时自动重建沙盒（重装 skills、回灌 persisted 文件、从 S3 重载历史），会话无缝继续
 - 崩溃恢复（热/冷 session）：session 创建时 spec 落盘 S3（`sessions/{id}/spec.json`），每个 turn 的 user 消息先写盘再执行（write-ahead）。节点崩溃后 etcd 归属记录消失，任意节点收到该 session 的请求时从 S3 收养（adopt）：加载 spec 与 persisted 清单、抢到归属（etcd put-if-absent）、重建历史——中断的 turn 以 `[turn interrupted]` 标记封存，不重放（工具副作用不可重放），客户端重发或继续即可。空闲超 `session.cold_timeout`（默认 0=关闭）的 session 整体换出为冷 session（摘内存、删 etcd、断开 SSE），下次访问经同一条 adopt 路径复活；换出后事件序号从 0 重启，客户端以 sync 帧为准重置。**注意**：spec 含 model/MCP headers 中的凭证，会随 spec.json 进入 S3 bucket（与全部会话历史同一信任域）
 - 后台进程退出通知：shell 后台命令（`bg: true` 或超 30s 前台窗口）退出时，集群自动合成一条 user 消息（`<background_processes_exited>`，含 pid/command/exit_code/输出文件路径）并开一个新 turn，Agent 立即自行善后（查输出、继续后续工作）；turn 运行中积累的多个退出会合并为一条消息、turn 结束自动补发。对客户端完全透明——合成 turn 就是普通 turn，消息以 user 身份出现在事件流与历史中
-- 子 session 创建与结果汇聚（二期）
 
 ## 客户端用法
 

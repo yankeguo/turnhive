@@ -150,6 +150,40 @@ func TestConnectMCPServersHeaders(t *testing.T) {
 	}
 }
 
+func TestLoopMCPSessionHeader(t *testing.T) {
+	// The Loop injects the fixed session header into every MCP
+	// connection on top of the spec headers.
+	var gotSession, gotAuth string
+	inner := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return newMCPEchoServer() }, nil)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSession = r.Header.Get(SessionHeader)
+		gotAuth = r.Header.Get("Authorization")
+		inner.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	fs := &fakeStream{}
+	fs.textReply("ok")
+	l := newTestLoop(LoopConfig{
+		ModelName: "test-model",
+		SessionID: "sess-mcp",
+		MCPServers: []MCPServerSpec{{
+			Name:    "test",
+			URL:     ts.URL,
+			Headers: map[string]string{"Authorization": "Bearer secret"},
+		}},
+	}, fs)
+	if err := l.RunTurn(context.Background(), "hi", &fakeReporter{}); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if gotSession != "sess-mcp" {
+		t.Fatalf("session header = %q, want sess-mcp", gotSession)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("spec headers not preserved, got Authorization %q", gotAuth)
+	}
+}
+
 func TestMCPToolErrorResult(t *testing.T) {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "v0.0.1"}, nil)
 	mcp.AddTool(srv, &mcp.Tool{Name: "fail"}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
