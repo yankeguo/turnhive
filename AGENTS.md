@@ -27,7 +27,7 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 └── storage/         # S3 封装（历史 JSONL、skill tar presign）
 ```
 
-另外有 `refs/` 目录存放参考项目副本，刻意不被 git 追踪（已在 .gitignore 中忽略）；参考项目说明及与 agentdesk-runner 的功能对比记录见 `AGENTS.local.md`（同样不被 git 追踪的本地文档），需要参考信息时先读它。
+另外有 `refs/` 目录存放参考项目副本（agentdesk-runner、ironhive 的本地副本），刻意不被 git 追踪（已在 .gitignore 中忽略）；说明见 `AGENTS.local.md`（同样不被 git 追踪的本地文档），仅供参考，无对标关系。
 
 ## 代码约定
 
