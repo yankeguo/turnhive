@@ -666,13 +666,17 @@ func TestLoopFailTurnSavesWithCancelledContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
+	// Two saves happen: the write-ahead of the user message (allowed to
+	// ride the turn context — a cancelled context just makes it fail,
+	// and the final save below still covers the pair) and failTurn's
+	// partial-reply save, which must use a detached context.
 	if hist.ctxCancelled {
-		t.Fatalf("saveHistory used the cancelled turn context")
+		t.Fatalf("failTurn's save used the cancelled turn context")
 	}
-	if len(hist.saved) != 1 {
-		t.Fatalf("expected history saved, got %d saves", len(hist.saved))
+	if len(hist.saved) != 2 {
+		t.Fatalf("expected write-ahead + final save, got %d saves", len(hist.saved))
 	}
-	saved := hist.saved[0]
+	saved := hist.saved[len(hist.saved)-1]
 	if len(saved) != 2 || saved[0].Role != "user" || saved[1].Role != "assistant" || saved[1].Content != "partial" {
 		t.Fatalf("expected partial pair persisted, got %+v", saved)
 	}
@@ -849,5 +853,64 @@ func TestLoopMCPToolNameCollisionSkipped(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("colliding MCP tool must not duplicate an existing def: %+v", fs.lastRequest().Tools)
+	}
+}
+
+func TestLoopWriteAheadSavesUserMessageFirst(t *testing.T) {
+	fs := &fakeStream{}
+	fs.textReply("answer")
+	hist := &fakeHistory{}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist}, fs)
+
+	r := &fakeReporter{}
+	if err := l.RunTurn(context.Background(), "question", r); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	// Save sequence: write-ahead (user only) then the completed pair.
+	if len(hist.saved) != 2 {
+		t.Fatalf("expected write-ahead + final save, got %d saves", len(hist.saved))
+	}
+	if ahead := hist.saved[0]; len(ahead) != 1 || ahead[0].Role != "user" || ahead[0].Content != "question" {
+		t.Fatalf("expected the write-ahead to persist the user message, got %+v", ahead)
+	}
+	if final := hist.saved[1]; len(final) != 2 || final[1].Role != "assistant" || final[1].Content != "answer" {
+		t.Fatalf("expected the final save to persist the pair, got %+v", final)
+	}
+}
+
+func TestLoopSealInterruptedTurn(t *testing.T) {
+	// A history ending with a dangling user message (the node crashed
+	// mid-turn) gets the interruption marker as the assistant reply.
+	hist := &fakeHistory{msgs: []llm.Message{
+		{Role: "user", Content: "earlier"},
+		{Role: "assistant", Content: "answered"},
+		{Role: "user", Content: "never answered"},
+	}}
+	l := newTestLoop(LoopConfig{ModelName: "test-model", History: hist}, &fakeStream{})
+	if err := l.SealInterruptedTurn(context.Background()); err != nil {
+		t.Fatalf("SealInterruptedTurn: %v", err)
+	}
+	msgs := l.Messages()
+	if len(msgs) != 4 || msgs[3].Role != "assistant" || msgs[3].Content != InterruptedTurnMarker {
+		t.Fatalf("expected the interruption marker appended, got %+v", msgs)
+	}
+	if saved := hist.lastSaved(); len(saved) != 4 {
+		t.Fatalf("expected the sealed history saved, got %+v", saved)
+	}
+
+	// A paired history is left untouched.
+	hist2 := &fakeHistory{msgs: []llm.Message{
+		{Role: "user", Content: "earlier"},
+		{Role: "assistant", Content: "answered"},
+	}}
+	l2 := newTestLoop(LoopConfig{ModelName: "test-model", History: hist2}, &fakeStream{})
+	if err := l2.SealInterruptedTurn(context.Background()); err != nil {
+		t.Fatalf("SealInterruptedTurn: %v", err)
+	}
+	if msgs := l2.Messages(); len(msgs) != 2 {
+		t.Fatalf("paired history must be untouched, got %+v", msgs)
+	}
+	if len(hist2.saved) != 0 {
+		t.Fatalf("no save expected for a paired history, got %d", len(hist2.saved))
 	}
 }

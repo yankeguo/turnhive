@@ -108,3 +108,27 @@ func TestHubDropsSlowSubscriber(t *testing.T) {
 		t.Fatal("fresh subscriber did not receive event")
 	}
 }
+
+func TestHubCloseAll(t *testing.T) {
+	h := newEventHub()
+	ch1, _, _, _ := h.subscribe(0)
+	ch2, _, _, _ := h.subscribe(0)
+
+	h.closeAll()
+
+	// Every subscriber channel is closed; the buffer is untouched and a
+	// fresh subscriber still works (the hub of an evicted session is
+	// discarded as a whole, but closeAll itself must not brick it).
+	for _, ch := range []chan hubEvent{ch1, ch2} {
+		if _, ok := <-ch; ok {
+			t.Fatal("subscriber channel must be closed by closeAll")
+		}
+	}
+	ch3, _, _, _ := h.subscribe(0)
+	h.publish("turn-1", "delta", map[string]string{"text": "x"})
+	select {
+	case <-ch3:
+	default:
+		t.Fatal("fresh subscriber did not receive event after closeAll")
+	}
+}

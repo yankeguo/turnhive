@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -77,7 +78,7 @@ func TestPresignGet(t *testing.T) {
 }
 
 // fakeS3 is a minimal in-memory S3-compatible server handling path-style
-// PUT and GET.
+// PUT, GET, DELETE and bucket-level ListObjectsV2.
 type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
@@ -88,7 +89,16 @@ func newFakeS3() *fakeS3 {
 }
 
 func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Path-style addressing: /{bucket}/{key}.
+	// Path-style addressing: /{bucket}/{key}; "/{bucket}" or "/{bucket}/"
+	// is a bucket-level operation.
+	if r.URL.Path == "/test-bucket" || r.URL.Path == "/test-bucket/" {
+		if r.URL.Query().Get("list-type") == "2" {
+			f.serveList(w, r)
+			return
+		}
+		http.Error(w, "unsupported bucket operation", http.StatusBadRequest)
+		return
+	}
 	key := strings.TrimPrefix(r.URL.Path, "/test-bucket/")
 
 	switch r.Method {
@@ -116,9 +126,34 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
+	case http.MethodDelete:
+		f.mu.Lock()
+		delete(f.objects, key)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// serveList answers ListObjectsV2 with every key under the requested
+// prefix, unsorted (tests do not depend on order).
+func (f *fakeS3) serveList(w http.ResponseWriter, r *http.Request) {
+	prefix := r.URL.Query().Get("prefix")
+	f.mu.Lock()
+	var b strings.Builder
+	for key, body := range f.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		fmt.Fprintf(&b, "<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-09-02T00:00:00Z</LastModified></Contents>",
+			key, len(body))
+	}
+	f.mu.Unlock()
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?>`+
+		`<ListBucketResult><IsTruncated>false</IsTruncated>`+b.String()+`</ListBucketResult>`)
 }
 
 func TestNewEndpointWithScheme(t *testing.T) {
@@ -183,5 +218,57 @@ func TestPutGetObject(t *testing.T) {
 
 	if _, err = s.GetObject(ctx, "missing"); !errors.Is(err, ErrNotExist) {
 		t.Errorf("missing object: expected ErrNotExist, got %v", err)
+	}
+}
+
+func TestListAndDeleteObject(t *testing.T) {
+	server := httptest.NewServer(newFakeS3())
+	defer server.Close()
+
+	s, err := New(testConfig(server.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, key := range []string{
+		"sessions/s1/persisted/a.txt",
+		"sessions/s1/persisted/dir/b.txt",
+		"sessions/s2/persisted/c.txt",
+	} {
+		if err = s.PutObject(ctx, key, []byte("data-"+key)); err != nil {
+			t.Fatalf("PutObject %s: %v", key, err)
+		}
+	}
+
+	// List returns keys relative to the store prefix, filtered by prefix.
+	objs, err := s.ListObjects(ctx, "sessions/s1/persisted/")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("expected 2 objects, got %+v", objs)
+	}
+	for _, o := range objs {
+		if strings.HasPrefix(o.Key, "turnhive/") {
+			t.Errorf("key must be relative to the store prefix: %q", o.Key)
+		}
+		if o.Size != int64(len("data-"+o.Key)) {
+			t.Errorf("unexpected size for %q: %d", o.Key, o.Size)
+		}
+		if o.LastModified.IsZero() {
+			t.Errorf("LastModified not parsed for %q", o.Key)
+		}
+	}
+
+	// Delete removes one object; deleting a missing object is not an error.
+	if err = s.DeleteObject(ctx, "sessions/s1/persisted/a.txt"); err != nil {
+		t.Fatalf("DeleteObject: %v", err)
+	}
+	if _, err = s.GetObject(ctx, "sessions/s1/persisted/a.txt"); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("expected deleted object gone, got %v", err)
+	}
+	if err = s.DeleteObject(ctx, "sessions/s1/persisted/a.txt"); err != nil {
+		t.Fatalf("delete of a missing object must not fail: %v", err)
 	}
 }

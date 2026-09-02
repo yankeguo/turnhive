@@ -41,6 +41,12 @@ type Registry struct {
 
 	mu      sync.Mutex
 	leaseID clientv3.LeaseID
+
+	// OnReconnected, when set, is called after the node record is
+	// re-registered following a keepalive loss, so the controller can
+	// restore the session ownership records the lost lease took down.
+	// It is not called for the initial registration.
+	OnReconnected func(ctx context.Context)
 }
 
 // New creates a Registry. RegisterNode must be called before any session
@@ -92,10 +98,9 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 		// given up on the lease (e.g. after a network partition): the node
 		// record expires and every RegisterSession would fail with "lease
 		// not found" from here on. Re-register with backoff until success
-		// or shutdown. Note that session ownership records bound to the
-		// lost lease are NOT restored by this recovery; sessions created
-		// while the node was unregistered stay unregistered (their owner
-		// lookup fails open until the session ends).
+		// or shutdown. Session ownership records bound to the lost lease
+		// are restored through OnReconnected (if set) once the node record
+		// is back.
 		if ctx.Err() != nil {
 			return
 		}
@@ -121,6 +126,9 @@ func (r *Registry) RegisterNode(ctx context.Context) error {
 				continue
 			}
 			log.Printf("registry: node re-registered")
+			if r.OnReconnected != nil {
+				r.OnReconnected(ctx)
+			}
 			return
 		}
 	}()
@@ -171,6 +179,29 @@ func (r *Registry) UnregisterSession(ctx context.Context, sessionID string) erro
 		return fmt.Errorf("delete session record: %w", err)
 	}
 	return nil
+}
+
+// ClaimSession records this node as the owner of sessionID only when no
+// ownership record exists (put-if-absent), reporting whether the claim
+// was won. It is the adoption path's guard against two nodes claiming
+// the same orphaned session concurrently; the loser forwards the request
+// to the recorded owner.
+func (r *Registry) ClaimSession(ctx context.Context, sessionID string) (bool, error) {
+	r.mu.Lock()
+	leaseID := r.leaseID
+	r.mu.Unlock()
+	if leaseID == 0 {
+		return false, fmt.Errorf("node is not registered")
+	}
+	key := r.sessionKey(sessionID)
+	resp, err := r.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
+		Then(clientv3.OpPut(key, r.nodeID, clientv3.WithLease(leaseID))).
+		Commit()
+	if err != nil {
+		return false, fmt.Errorf("claim session record: %w", err)
+	}
+	return resp.Succeeded, nil
 }
 
 // SessionOwner resolves the advertise address of the node that owns

@@ -148,6 +148,61 @@ func (s *Store) GetObject(ctx context.Context, key string) ([]byte, error) {
 	return body, nil
 }
 
+// DeleteObject removes the object stored under key. Deleting a missing
+// object is not an error (S3 delete is idempotent).
+func (s *Store) DeleteObject(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.key(key)),
+	})
+	if err != nil {
+		return fmt.Errorf("delete object %q: %w", key, err)
+	}
+	return nil
+}
+
+// ObjectInfo describes one object found by ListObjects.
+type ObjectInfo struct {
+	// Key is the object key relative to the store's configured prefix.
+	Key string
+	// Size is the object size in bytes.
+	Size int64
+	// LastModified is the object's last-modified time as reported by the
+	// service.
+	LastModified time.Time
+}
+
+// ListObjects returns every object whose key starts with prefix (relative
+// to the store's configured prefix), following pagination.
+func (s *Store) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	var out []ObjectInfo
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(s.key(prefix)),
+	}
+	for {
+		page, err := s.client.ListObjectsV2(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("list objects %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			info := ObjectInfo{Key: aws.ToString(obj.Key), Size: aws.ToInt64(obj.Size)}
+			if obj.LastModified != nil {
+				info.LastModified = *obj.LastModified
+			}
+			// Strip the store prefix so callers see the same relative keys
+			// they pass to Get/Put.
+			info.Key = strings.TrimPrefix(info.Key, s.key(""))
+			out = append(out, info)
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		input.ContinuationToken = page.NextContinuationToken
+	}
+	return out, nil
+}
+
 // PresignGet returns a presigned URL that grants read access to the object
 // stored under key for ttl.
 func (s *Store) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {

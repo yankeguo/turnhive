@@ -232,7 +232,11 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) (st
 // all turns flow over it, sequenced per session; pass the last seen
 // Event.Seq as lastSeq to replay what was missed after a reconnect (0
 // replays the retained buffer; negative values are treated as 0). The
-// stream must be drained (or closed) to release the connection.
+// sync event that opens every stream is authoritative: when the session
+// was recovered from storage (its node crashed, or it was evicted after
+// cold_timeout) the numbering restarts, so discard any older seq and
+// resume from the sync event's Seq. The stream must be drained (or
+// closed) to release the connection.
 func (c *Client) Events(ctx context.Context, sessionID string, lastSeq int64) (*Stream, error) {
 	u := c.baseURL + "/v1/sessions/" + url.PathEscape(sessionID) + "/events"
 	if lastSeq > 0 {

@@ -71,6 +71,12 @@ type SessionConfig struct {
 	// on; the next message rebuilds the sandbox from skills and
 	// persisted files. Defaults to 30m.
 	IdleTimeout Duration `yaml:"idle_timeout"`
+	// ColdTimeout bounds how long a session may be inactive before it is
+	// evicted from memory and etcd to cold storage (its spec, history
+	// and persisted files stay in S3, and any node adopts it on the next
+	// request). Zero disables eviction; when set it must exceed
+	// IdleTimeout. Defaults to 0.
+	ColdTimeout Duration `yaml:"cold_timeout"`
 }
 
 // IronhiveConfig holds the settings for reaching an ironhive controller,
@@ -266,6 +272,12 @@ func (c *Config) validate() error {
 	}
 	if c.Session.IdleTimeout <= 0 {
 		return fmt.Errorf("session.idle_timeout must be positive")
+	}
+	if c.Session.ColdTimeout < 0 {
+		return fmt.Errorf("session.cold_timeout must not be negative")
+	}
+	if c.Session.ColdTimeout > 0 && c.Session.ColdTimeout <= c.Session.IdleTimeout {
+		return fmt.Errorf("session.cold_timeout must exceed session.idle_timeout")
 	}
 	return nil
 }

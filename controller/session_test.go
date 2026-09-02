@@ -367,3 +367,40 @@ func TestAddToolResultPendingCap(t *testing.T) {
 		t.Fatalf("re-report of a known call id: %v", err)
 	}
 }
+
+func TestTakeIfCold(t *testing.T) {
+	// Fresh session with activity: not cold.
+	sess := &Session{ID: "s"}
+	sess.setSandbox(&ironhive.Sandbox{Name: "sb"}, func() {})
+	sess.touch()
+	if _, _, cold := sess.takeIfCold(time.Hour); cold {
+		t.Fatal("an active session must not be cold")
+	}
+
+	// A running turn blocks eviction.
+	sess.startTurn("turn-1", func() {})
+	sess.mu.Lock()
+	sess.lastActivity = time.Now().Add(-2 * time.Hour)
+	sess.mu.Unlock()
+	if _, _, cold := sess.takeIfCold(time.Hour); cold {
+		t.Fatal("a session with a running turn must not be cold")
+	}
+	sess.finishTurn()
+
+	// Idle past the bound: evicted, closed, sandbox detached.
+	sb, stop, cold := sess.takeIfCold(time.Hour)
+	if !cold || sb == nil || stop == nil {
+		t.Fatalf("expected eviction with sandbox and renew func, got %v %v %v", sb, stop, cold)
+	}
+	if sess.hasSandbox() {
+		t.Fatal("sandbox must be detached after eviction")
+	}
+	// A second eviction attempt reports false (already closed).
+	if _, _, cold = sess.takeIfCold(time.Hour); cold {
+		t.Fatal("an already-evicted session must report false")
+	}
+	// setSandbox refuses the closed session.
+	if sess.setSandbox(&ironhive.Sandbox{Name: "sb2"}, func() {}) {
+		t.Fatal("setSandbox must refuse an evicted session")
+	}
+}

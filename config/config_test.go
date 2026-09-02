@@ -158,6 +158,16 @@ func TestLoadRejects(t *testing.T) {
 			wantErr: "session.idle_timeout must be positive",
 		},
 		{
+			name:    "negative cold timeout",
+			doc:     minimalValidYAML + "session:\n  cold_timeout: -1s\n",
+			wantErr: "session.cold_timeout must not be negative",
+		},
+		{
+			name:    "cold timeout not exceeding idle timeout",
+			doc:     minimalValidYAML + "session:\n  idle_timeout: 30m\n  cold_timeout: 10m\n",
+			wantErr: "session.cold_timeout must exceed session.idle_timeout",
+		},
+		{
 			name:    "unknown field rejected in strict mode",
 			doc:     minimalValidYAML + "session:\n  idle_timetout: 30m\n",
 			wantErr: "field idle_timetout not found",

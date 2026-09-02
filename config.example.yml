@@ -70,3 +70,12 @@ session:
   # rebuilds the sandbox from skills and persisted files (see the
   # persist tool). Default 30m.
   idle_timeout: 30m
+  # How long a session may be inactive before it is evicted from memory
+  # and etcd to cold storage: its spec, history and persisted files stay
+  # in S3 and any node adopts it on the next request. Must exceed
+  # idle_timeout. Default 0 (disabled; sessions stay hot until deleted).
+  # Note: crash recovery persists the session spec — including model and
+  # MCP credentials in `headers` — to S3 (sessions/{id}/spec.json); the
+  # bucket already holds full conversation histories, so it shares one
+  # trust domain.
+  cold_timeout: 0

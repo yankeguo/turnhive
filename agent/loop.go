@@ -182,8 +182,17 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		}
 	}
 
-	// The request messages are [system] + history + the user message +
-	// the transient tool exchanges of this turn.
+	// Write-ahead: the user message joins the history (and is persisted,
+	// best-effort) before the turn starts streaming, so a node crash
+	// mid-turn does not lose it. A session adopted from storage
+	// afterwards seals the dangling user message with the interruption
+	// marker (SealInterruptedTurn).
+	l.appendHistory(userMsg)
+	_ = l.saveHistory(ctx)
+
+	// The request messages are [system] + history (which now ends with
+	// this turn's user message) + the transient tool exchanges of this
+	// turn.
 	l.mu.Lock()
 	working := make([]llm.Message, 0, len(l.history)+2)
 	working = append(working, l.history...)
@@ -191,7 +200,6 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 	if l.cfg.SystemPrompt != "" {
 		working = append([]llm.Message{{Role: "system", Content: l.cfg.SystemPrompt}}, working...)
 	}
-	working = append(working, userMsg)
 
 	var stepText strings.Builder
 	for step := 0; step < maxTurnSteps; step++ {
@@ -212,14 +220,15 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 			}
 		})
 		if err != nil {
-			return l.failTurn(ctx, r, userMsg, stepText.String(), err)
+			return l.failTurn(ctx, r, stepText.String(), err)
 		}
 
 		if len(msg.ToolCalls) == 0 {
-			// Plain text reply: the turn ends. History only ever
-			// carries the {user, assistant} pair — the tool exchanges
-			// of this turn stay transient.
-			l.appendHistory(userMsg, llm.Message{Role: "assistant", Content: msg.Content})
+			// Plain text reply: the turn ends. The user message is already
+			// in the history (write-ahead); only the assistant reply is
+			// appended. History only ever carries the {user, assistant}
+			// pair — the tool exchanges of this turn stay transient.
+			l.appendHistory(llm.Message{Role: "assistant", Content: msg.Content})
 			// Post-turn compaction: a turn that pushed usage past the
 			// overflow threshold condenses older turns into a summary.
 			if l.cfg.MaxContext > 0 && IsOverflow(usage, l.cfg.MaxContext) {
@@ -259,9 +268,10 @@ func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 		}
 	}
 
-	// Persist the {user, assistant-partial} pair like any other failed
-	// turn, so a rebuilt session keeps what was said.
-	return l.failTurn(ctx, r, userMsg, stepText.String(), errors.New("max steps exceeded"))
+	// Persist the assistant-partial after the write-ahead user message,
+	// like any other failed turn, so a rebuilt session keeps what was
+	// said.
+	return l.failTurn(ctx, r, stepText.String(), errors.New("max steps exceeded"))
 }
 
 // LoadHistory eagerly loads the persisted history. RunTurn also loads
@@ -310,11 +320,37 @@ func (l *Loop) saveHistory(ctx context.Context) error {
 	return l.cfg.History.Save(ctx, msgs)
 }
 
+// InterruptedTurnMarker is appended as the assistant reply of a turn
+// that never completed (node crash mid-turn) when a session is adopted
+// from storage, so the model and the client can see the turn was
+// interrupted rather than answered.
+const InterruptedTurnMarker = "[turn interrupted: the node running it failed before the turn completed]"
+
+// SealInterruptedTurn appends InterruptedTurnMarker as the assistant
+// reply when the history ends with a dangling user message (a turn that
+// never completed, e.g. after a node crash), and saves the history.
+// Otherwise it is a no-op. Called when a session is adopted from
+// storage.
+func (l *Loop) SealInterruptedTurn(ctx context.Context) error {
+	if err := l.loadHistory(ctx); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	dangling := len(l.history) > 0 && l.history[len(l.history)-1].Role == "user"
+	l.mu.Unlock()
+	if !dangling {
+		return nil
+	}
+	l.appendHistory(llm.Message{Role: "assistant", Content: InterruptedTurnMarker})
+	return l.saveHistory(ctx)
+}
+
 // failTurn ends a turn after a stream error or cancellation: the partial
-// assistant text accumulated so far is persisted (best-effort), and the
-// error is reported and returned.
-func (l *Loop) failTurn(ctx context.Context, r Reporter, userMsg llm.Message, partialText string, err error) error {
-	l.appendHistory(userMsg, llm.Message{Role: "assistant", Content: partialText})
+// assistant text accumulated so far is persisted (best-effort) after the
+// user message that write-ahead already stored, and the error is
+// reported and returned.
+func (l *Loop) failTurn(ctx context.Context, r Reporter, partialText string, err error) error {
+	l.appendHistory(llm.Message{Role: "assistant", Content: partialText})
 	// ctx may already be cancelled (session deleted, controller closing,
 	// turn timeout): save under a detached context so the partial reply
 	// still reaches the history store.

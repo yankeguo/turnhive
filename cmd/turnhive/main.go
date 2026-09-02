@@ -52,7 +52,11 @@ func main() {
 		log.Fatalf("connect s3: %v", err)
 	}
 	ihClient := ironhive.NewClient(cfg.Ironhive.URL)
-	ctrl := controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease), time.Duration(cfg.Session.IdleTimeout))
+	ctrl := controller.New(cfg.Node.ID, reg, ihClient, store, time.Duration(cfg.Ironhive.Lease), time.Duration(cfg.Session.IdleTimeout), time.Duration(cfg.Session.ColdTimeout))
+	// An etcd keepalive loss takes down the node record and every session
+	// record with it; once the node record is back, restore the session
+	// records this node still holds in memory.
+	reg.OnReconnected = ctrl.ReregisterSessions
 	ctrl.RegisterRoutes(mux)
 
 	srv := &http.Server{

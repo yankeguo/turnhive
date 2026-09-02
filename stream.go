@@ -20,6 +20,10 @@ const (
 	// EventSync is the control event delivered on connect: Event.TurnID
 	// is the currently running turn ("" when idle), Event.Seq the latest
 	// sequence number and Event.Messages the full merged history.
+	// Event.Seq is also the reset baseline for reconnect bookkeeping: a
+	// session recovered from storage (node crash, cold eviction) restarts
+	// its numbering, so on a sync event discard any previously tracked
+	// seq and resume from Event.Seq.
 	EventSync EventType = "sync"
 	// EventTurnStarted marks the beginning of a turn (Event.TurnID).
 	EventTurnStarted EventType = "turn_started"

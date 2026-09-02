@@ -100,6 +100,19 @@ func (h *eventHub) unsubscribe(ch chan hubEvent) {
 	h.mu.Unlock()
 }
 
+// closeAll disconnects every subscriber without touching the buffer. Used
+// by cold eviction: the SSE handlers return, and the clients' reconnects
+// re-adopt the session from storage and resynchronize from its sync
+// frame.
+func (h *eventHub) closeAll() {
+	h.mu.Lock()
+	for ch := range h.subs {
+		delete(h.subs, ch)
+		close(ch)
+	}
+	h.mu.Unlock()
+}
+
 // hubReporter implements agent.Reporter, publishing one session event
 // per call. Every payload carries the turn id so subscribers can
 // correlate events to turns.

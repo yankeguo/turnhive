@@ -136,6 +136,26 @@ func (s *Session) closeSession() (*ironhive.Sandbox, context.CancelFunc) {
 	return sb, stop
 }
 
+// takeIfCold marks the session closed and detaches its sandbox for
+// release when no turn is running and the session has been inactive for
+// at least d; it reports false otherwise. Checking, closing and
+// detaching in a single critical section closes the race with
+// startTurn/ensureSandbox, like takeSandboxIfIdle. Unlike the idle reap,
+// eviction retires the whole session (to cold storage) — a later request
+// re-adopts it from S3.
+func (s *Session) takeIfCold(d time.Duration) (*ironhive.Sandbox, context.CancelFunc, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.turnID != "" || time.Since(s.lastActivity) < d {
+		return nil, nil, false
+	}
+	s.closed = true
+	sb, stop := s.Sandbox, s.stopRenew
+	s.Sandbox = nil
+	s.stopRenew = nil
+	return sb, stop, true
+}
+
 // getLoop returns the session's agent loop.
 func (s *Session) getLoop() *agent.Loop {
 	s.mu.Lock()

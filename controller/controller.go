@@ -74,9 +74,18 @@ type Controller struct {
 	// idleTimeout bounds session inactivity before the idle reaper
 	// releases the session's sandbox (the session lives on).
 	idleTimeout time.Duration
+	// coldTimeout bounds session inactivity before the sweeper evicts the
+	// whole session from memory and etcd to cold storage; zero disables
+	// eviction. A later request re-adopts the session from S3.
+	coldTimeout time.Duration
 
 	// sessions holds the sessions owned by this node, keyed by session ID.
 	sessions sync.Map
+	// adopting tracks in-flight session adoptions (id -> chan struct{},
+	// closed on completion): concurrent requests for the same cold
+	// session — local or forwarded mid-adoption — wait for the outcome
+	// instead of duplicating the work or being 404'd.
+	adopting sync.Map
 	// proxies caches one reverse proxy per owner node address.
 	proxies sync.Map
 
@@ -86,10 +95,10 @@ type Controller struct {
 
 // New creates a Controller for the given node and starts the idle
 // reaper.
-func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *storage.Store, sandboxLease, idleTimeout time.Duration) *Controller {
+func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *storage.Store, sandboxLease, idleTimeout, coldTimeout time.Duration) *Controller {
 	c := &Controller{
 		nodeID: nodeID, registry: reg, ironhive: ih, store: store,
-		sandboxLease: sandboxLease, idleTimeout: idleTimeout,
+		sandboxLease: sandboxLease, idleTimeout: idleTimeout, coldTimeout: coldTimeout,
 		sweeperStop: make(chan struct{}),
 	}
 	c.sweeperDone.Add(1)
@@ -98,7 +107,8 @@ func New(nodeID string, reg *registry.Registry, ih *ironhive.Client, store *stor
 }
 
 // runSweeper periodically releases the sandboxes of sessions that have
-// been idle past idleTimeout, until Close.
+// been idle past idleTimeout, and evicts sessions idle past coldTimeout
+// to cold storage (when configured), until Close.
 func (c *Controller) runSweeper() {
 	defer c.sweeperDone.Done()
 	interval := c.idleTimeout / 2
@@ -113,8 +123,64 @@ func (c *Controller) runSweeper() {
 			return
 		case <-ticker.C:
 			c.reapIdleSandboxes()
+			if c.coldTimeout > 0 {
+				c.evictColdSessions()
+			}
 		}
 	}
+}
+
+// evictColdSessions retires every session that has been inactive for at
+// least coldTimeout: it leaves memory and etcd entirely and lives on
+// only in S3 (spec, history, persisted files), where any node adopts it
+// on the next request. Eviction reuses the teardown actions of DELETE
+// (cancel turn — none is running by definition — stop renewal, release
+// sandbox) plus closing the event hub so live SSE subscribers reconnect
+// and resynchronize.
+func (c *Controller) evictColdSessions() {
+	c.sessions.Range(func(_, v any) bool {
+		sess, ok := v.(*Session)
+		if !ok {
+			return true
+		}
+		sb, stop, evicted := sess.takeIfCold(c.coldTimeout)
+		if !evicted {
+			return true
+		}
+		c.sessions.Delete(sess.ID)
+		if stop != nil {
+			stop()
+		}
+		if sb != nil {
+			log.Printf("session %s idle past %s, releasing sandbox %s", sess.ID, c.coldTimeout, sb.Name)
+			releaseSandbox(sb)
+		}
+		sess.hub.closeAll()
+		ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+		if err := c.registry.UnregisterSession(ctx, sess.ID); err != nil {
+			log.Printf("unregister cold session %s: %v", sess.ID, err)
+		}
+		cancel()
+		log.Printf("session %s idle past %s, evicted to cold storage", sess.ID, c.coldTimeout)
+		return true
+	})
+}
+
+// ReregisterSessions re-registers the ownership of every session held in
+// memory. It is wired to registry.OnReconnected: an etcd keepalive loss
+// takes down the node record and every session record with it, and this
+// restores the latter once the node record is back.
+func (c *Controller) ReregisterSessions(ctx context.Context) {
+	c.sessions.Range(func(_, v any) bool {
+		sess, ok := v.(*Session)
+		if !ok {
+			return true
+		}
+		if err := c.registry.RegisterSession(ctx, sess.ID); err != nil {
+			log.Printf("re-register session %s: %v", sess.ID, err)
+		}
+		return true
+	})
 }
 
 // reapIdleSandboxes releases the sandbox of every session that has been
@@ -185,6 +251,21 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Persist the creation spec so any node can adopt the session when
+	// its owner dies (or after a cold eviction). A created session must
+	// be adoptable, so a failed write aborts the creation.
+	if err := writeSessionSpec(allocCtx, c.store, id, req); err != nil {
+		log.Printf("persist spec for session %s: %v", id, err)
+		if sb, stop := sess.takeSandbox(); sb != nil {
+			if stop != nil {
+				stop()
+			}
+			releaseSandbox(sb)
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to persist session spec"})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), lookupTimeout)
 	defer cancel()
 	if err := c.registry.RegisterSession(ctx, id); err != nil {
@@ -194,6 +275,11 @@ func (c *Controller) handleCreateSession(w http.ResponseWriter, r *http.Request)
 				stop()
 			}
 			releaseSandbox(sb)
+		}
+		// Best-effort: leave no spec behind for a session that was never
+		// created, or a later request would adopt a ghost.
+		if derr := c.store.DeleteObject(ctx, specObjectKey(id)); derr != nil {
+			log.Printf("delete spec of unregistered session %s: %v", id, derr)
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to register session"})
 		return
@@ -583,6 +669,11 @@ func (c *Controller) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	if err := c.registry.UnregisterSession(ctx, id); err != nil {
 		log.Printf("unregister session %s: %v", id, err)
 	}
+	// The spec is the adoption handle: deleting the session must make it
+	// un-adoptable. History and persisted files stay, as before.
+	if err := c.store.DeleteObject(ctx, specObjectKey(id)); err != nil {
+		log.Printf("delete spec of session %s: %v", id, err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -628,6 +719,20 @@ func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id str
 	if _, ok := c.sessions.Load(id); ok {
 		return true
 	}
+	// An adoption is in flight on this node (a concurrent request is
+	// recovering this cold session): wait for it instead of duplicating
+	// the work — or 404ing a forwarded request whose owner is still
+	// mid-adoption.
+	if ch, ok := c.adopting.Load(id); ok {
+		select {
+		case <-ch.(chan struct{}):
+		case <-r.Context().Done():
+			return false
+		}
+		if _, ok = c.sessions.Load(id); ok {
+			return true
+		}
+	}
 	// Already forwarded once: the owner does not have this session,
 	// so it does not exist. Never forward a second time.
 	if r.Header.Get(headerForwarded) != "" {
@@ -644,8 +749,38 @@ func (c *Controller) routeSession(w http.ResponseWriter, r *http.Request, id str
 		return false
 	}
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
-		return false
+		// No owner record: the session may be cold — its owner node died
+		// (the lease took the record down) or it was evicted past
+		// cold_timeout. Adopt it from storage when a spec exists.
+		adoptCtx, adoptCancel := context.WithTimeout(r.Context(), adoptTimeout)
+		defer adoptCancel()
+		adopted, aerr := c.adoptSession(adoptCtx, id)
+		switch {
+		case errors.Is(aerr, errClaimLost):
+			// A concurrent adoption claimed the session: serve it locally
+			// when this node won in the meantime, otherwise re-resolve
+			// and forward to the winner. The first lookup context may be
+			// expired by the adoption attempt; use a fresh one.
+			if _, ok = c.sessions.Load(id); ok {
+				return true
+			}
+			retryCtx, retryCancel := context.WithTimeout(r.Context(), lookupTimeout)
+			defer retryCancel()
+			addr, ok, err = c.registry.SessionOwner(retryCtx, id)
+			if err != nil || !ok {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+				return false
+			}
+		case aerr != nil:
+			log.Printf("adopt session %s: %v", id, aerr)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to recover session"})
+			return false
+		case adopted:
+			return true
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+			return false
+		}
 	}
 	p, err := c.proxy(addr)
 	if err != nil {
