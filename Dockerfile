@@ -1,22 +1,17 @@
-# turnhive server image.
-#
-# The build is a single stage: the binary is compiled on the host (Go
-# 1.27, CGO disabled) and copied in, so the image build needs no network
-# beyond the base image. Build from the repository root:
-#
-#   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build/turnhive ./cmd/turnhive
-#   docker build -t 127.0.0.1:5000/turnhive:dev .
-#
-# The base image is the same ubuntu the local ironhive sandboxes use; any
-# minimal base with CA certificates works.
+FROM golang:1.27 AS builder
+ENV CGO_ENABLED=0
+WORKDIR /go/src/app
+COPY . .
+RUN go build -trimpath -ldflags="-s -w" -o /turnhive ./cmd/turnhive
 
-FROM 127.0.0.1:5000/ubuntu:26.04
-
-# CA certificates for outbound HTTPS (the LLM endpoint); the ubuntu base
-# keeps them out of the default install set.
-COPY build/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY build/turnhive /usr/bin/turnhive
-
+FROM debian:bookworm-slim
+# ca-certificates for outbound HTTPS (the LLM endpoint). The server spawns
+# no child processes (sandbox execution is remote via ironhive), so no
+# init/reaper is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+COPY --from=builder /turnhive /usr/bin/turnhive
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/turnhive"]
 CMD ["-config", "/etc/turnhive/config.yml"]

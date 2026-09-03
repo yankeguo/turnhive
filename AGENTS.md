@@ -8,10 +8,11 @@ turnhive：可水平扩展的 Agent 集群服务。对外只暴露极简 Session
 go build ./...     # 编译
 go vet ./...       # 静态检查
 go test ./...      # 单元测试（agent / llm / storage / 根目录 client）
+go test -race ./...  # 竞态检查（CI 同样执行）
 go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 ```
 
-提交前必须通过以上全部命令。没有 linter 配置文件，保持 `gofmt`/`go vet` 干净即可。
+提交前必须通过以上全部命令。没有 linter 配置文件，保持 `gofmt`/`go vet` 干净即可（CI 会检查 `gofmt -l` 为空）。
 
 ## 项目结构
 
@@ -24,7 +25,9 @@ go run ./cmd/turnhive -config config.yml   # 本地启动（需要 config.yml）
 ├── controller/      # HTTP 路由与业务逻辑（含跨节点转发、SSE）
 ├── llm/             # OpenAI-compatible 流式 chat completions 客户端
 ├── registry/        # 基于 etcd 的节点发现、存活与 session 归属
-└── storage/         # S3 封装（历史 JSONL、skill tar presign）
+├── storage/         # S3 封装（历史 JSONL、skill tar presign）
+├── Dockerfile       # 多阶段发布构建（仓库内编译，不依赖宿主机产物）
+└── .github/workflows/release.yml  # CI（gofmt/vet/test/race/build）+ 镜像发布 ghcr.io 与 quay.io
 ```
 
 另外有 `refs/` 目录存放参考项目副本（agentdesk-runner、ironhive 的本地副本），刻意不被 git 追踪（已在 .gitignore 中忽略）；说明见 `AGENTS.local.md`（同样不被 git 追踪的本地文档），仅供参考，无对标关系。

@@ -181,6 +181,8 @@ go run ./cmd/turnhive
 # listening on :8080
 ```
 
+发布镜像由 CI（`.github/workflows/release.yml`）多阶段构建并同时推送：`ghcr.io/yankeguo/turnhive` 与 `quay.io/yankeguo/turnhive`（main 分支更新 `latest` / `latest-<sha>`，git tag 发布同名镜像标签）。
+
 ## License
 
 见 [LICENSE](LICENSE)。
