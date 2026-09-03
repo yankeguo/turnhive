@@ -22,21 +22,21 @@ func jsonString(s string) string {
 	return string(b)
 }
 
-// uploadCall records one file injection into the fake sandbox.
-type uploadCall struct {
+// fileInjectCall records one file injection into the fake sandbox.
+type fileInjectCall struct {
 	Path string
 	URL  string
 }
 
-// fakeUploadSandbox emulates just enough of ironhive for attach tests:
+// fakeFileSandbox emulates just enough of ironhive for attach tests:
 // allocate returns a sandbox handle, and PUT /agent/v1/file?url= fetches
 // the URL itself (the presigned-URL injection path).
-type fakeUploadSandbox struct {
+type fakeFileSandbox struct {
 	mu    sync.Mutex
-	calls []uploadCall
+	calls []fileInjectCall
 }
 
-func (f *fakeUploadSandbox) handler(t *testing.T) http.Handler {
+func (f *fakeFileSandbox) handler(t *testing.T) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /controller/v1/allocate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -55,7 +55,7 @@ func (f *fakeUploadSandbox) handler(t *testing.T) http.Handler {
 		}
 		resp.Body.Close()
 		f.mu.Lock()
-		f.calls = append(f.calls, uploadCall{Path: r.URL.Query().Get("path"), URL: u})
+		f.calls = append(f.calls, fileInjectCall{Path: r.URL.Query().Get("path"), URL: u})
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"message":"OK"}`))
@@ -63,18 +63,18 @@ func (f *fakeUploadSandbox) handler(t *testing.T) http.Handler {
 	return mux
 }
 
-func (f *fakeUploadSandbox) injected() []uploadCall {
+func (f *fakeFileSandbox) injected() []fileInjectCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]uploadCall(nil), f.calls...)
+	return append([]fileInjectCall(nil), f.calls...)
 }
 
-// fakePresignStore serves presigned GETs from an in-memory map.
-type fakePresignStore struct {
+// fakeFileStore serves presigned GETs from an in-memory map.
+type fakeFileStore struct {
 	objects map[string][]byte
 }
 
-func (f *fakePresignStore) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
+func (f *fakeFileStore) PresignGet(_ context.Context, key string, _ time.Duration) (string, error) {
 	body, ok := f.objects[key]
 	if !ok {
 		return "", fmt.Errorf("no such key: %s", key)
@@ -86,7 +86,7 @@ func (f *fakePresignStore) PresignGet(_ context.Context, key string, _ time.Dura
 }
 
 func TestAttachFilesInjectsIntoLiveSandbox(t *testing.T) {
-	fake := &fakeUploadSandbox{}
+	fake := &fakeFileSandbox{}
 	srv := httptest.NewServer(fake.handler(t))
 	defer srv.Close()
 	sb, err := ironhive.NewClient(srv.URL).Allocate(context.Background(), "default", time.Minute)
@@ -94,23 +94,23 @@ func TestAttachFilesInjectsIntoLiveSandbox(t *testing.T) {
 		t.Fatalf("allocate: %v", err)
 	}
 
-	store := &fakePresignStore{objects: map[string][]byte{"k1": []byte("x")}}
-	c := &Controller{uploadStore: store}
+	store := &fakeFileStore{objects: map[string][]byte{"k1": []byte("x")}}
+	c := &Controller{fileStore: store}
 	sess := &Session{ID: "s", hub: newEventHub()}
 	if !sess.setSandbox(sb, func() {}) {
 		t.Fatal("setSandbox must succeed")
 	}
 
-	recs := []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1", Size: 1}}
+	recs := []agent.FileRecord{{Name: "a.txt", ObjectKey: "k1", Size: 1}}
 	if err := c.attachFiles(context.Background(), sess, recs); err != nil {
 		t.Fatalf("attachFiles: %v", err)
 	}
 	calls := fake.injected()
-	if len(calls) != 1 || calls[0].Path != agent.UploadsRoot+"/a.txt" {
+	if len(calls) != 1 || calls[0].Path != agent.FilesRoot+"/a.txt" {
 		t.Fatalf("injected: %+v", calls)
 	}
-	if got := sess.Uploads(); len(got) != 1 || got[0].Name != "a.txt" {
-		t.Fatalf("uploads: %+v", got)
+	if got := sess.Files(); len(got) != 1 || got[0].Name != "a.txt" {
+		t.Fatalf("files: %+v", got)
 	}
 }
 
@@ -135,12 +135,12 @@ func TestAttachFilesAfterReap(t *testing.T) {
 
 	// Attach afterwards: no sandbox, so nothing is injected, but the
 	// record is stored for the next build.
-	recs := []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1"}}
+	recs := []agent.FileRecord{{Name: "a.txt", ObjectKey: "k1"}}
 	if err := c.attachFiles(context.Background(), sess, recs); err != nil {
 		t.Fatalf("attachFiles: %v", err)
 	}
-	if got := sess.Uploads(); len(got) != 1 {
-		t.Fatalf("uploads: %+v", got)
+	if got := sess.Files(); len(got) != 1 {
+		t.Fatalf("files: %+v", got)
 	}
 }
 
@@ -151,7 +151,7 @@ func TestAttachFilesRejectsClosedSession(t *testing.T) {
 	c := &Controller{}
 	sess := &Session{ID: "s", hub: newEventHub()}
 	sess.closeSession()
-	err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "a.txt", ObjectKey: "k1"}})
+	err := c.attachFiles(context.Background(), sess, []agent.FileRecord{{Name: "a.txt", ObjectKey: "k1"}})
 	if !errors.Is(err, errSessionClosed) {
 		t.Fatalf("err = %v, want errSessionClosed", err)
 	}
@@ -160,19 +160,19 @@ func TestAttachFilesRejectsClosedSession(t *testing.T) {
 func TestAttachFilesCap(t *testing.T) {
 	c := &Controller{}
 	sess := &Session{ID: "s", hub: newEventHub()}
-	for i := 0; i < uploadsNameCountCap; i++ {
-		sess.recordUpload(agent.UploadRecord{Name: fmt.Sprintf("f%02d.txt", i), ObjectKey: "k"})
+	for i := 0; i < filesNameCountCap; i++ {
+		sess.recordFile(agent.FileRecord{Name: fmt.Sprintf("f%02d.txt", i), ObjectKey: "k"})
 	}
 	// A new name past the cap is rejected without partial state.
-	err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "new.txt", ObjectKey: "k"}})
+	err := c.attachFiles(context.Background(), sess, []agent.FileRecord{{Name: "new.txt", ObjectKey: "k"}})
 	if !errors.Is(err, errTooManyFiles) {
 		t.Fatalf("err = %v, want errTooManyFiles", err)
 	}
-	if got := sess.Uploads(); len(got) != uploadsNameCountCap {
-		t.Fatalf("uploads after reject: %d", len(got))
+	if got := sess.Files(); len(got) != filesNameCountCap {
+		t.Fatalf("files after reject: %d", len(got))
 	}
 	// Re-attaching an existing name stays under the cap.
-	if err := c.attachFiles(context.Background(), sess, []agent.UploadRecord{{Name: "f00.txt", ObjectKey: "k2"}}); err != nil {
+	if err := c.attachFiles(context.Background(), sess, []agent.FileRecord{{Name: "f00.txt", ObjectKey: "k2"}}); err != nil {
 		t.Fatalf("re-attach: %v", err)
 	}
 }
@@ -186,11 +186,11 @@ func TestFilesManifestRoundTrip(t *testing.T) {
 		t.Fatalf("missing manifest: got=%v err=%v", got, err)
 	}
 
-	uploads := []agent.UploadRecord{
+	records := []agent.FileRecord{
 		{Name: "b.csv", ObjectKey: "uploads/sess-1/t2-b.csv", Size: 2},
 		{Name: "a.csv", ObjectKey: "uploads/sess-1/t1-a.csv", Size: 1},
 	}
-	if err := writeFilesManifest(ctx, store, "sess-1", uploads); err != nil {
+	if err := writeFilesManifest(ctx, store, "sess-1", records); err != nil {
 		t.Fatalf("writeFilesManifest: %v", err)
 	}
 	got, err := loadFilesManifest(ctx, store, "sess-1")
@@ -236,7 +236,7 @@ func TestHandleGetSession(t *testing.T) {
 	defer ts.Close()
 
 	sess := &Session{ID: "s", hub: newEventHub()}
-	sess.recordUpload(agent.UploadRecord{Name: "data.csv", ObjectKey: "uploads/s/t-data.csv", Size: 7})
+	sess.recordFile(agent.FileRecord{Name: "data.csv", ObjectKey: "uploads/s/t-data.csv", Size: 7})
 	c.sessions.Store("s", sess)
 
 	resp, err := http.Get(ts.URL + "/v1/sessions/s")
@@ -297,17 +297,17 @@ func TestHandleCreateFiles(t *testing.T) {
 	// Happy path through the internal flow the handler runs (the HTTP
 	// handler's manifest write needs a real S3 store; it is best-effort
 	// and covered by TestFilesManifestRoundTrip).
-	rec := agent.UploadRecord{Name: "data.csv", ObjectKey: "uploads/s/t-data.csv", Size: 7}
-	sess.recordUpload(rec)
-	got := sess.Uploads()
+	rec := agent.FileRecord{Name: "data.csv", ObjectKey: "uploads/s/t-data.csv", Size: 7}
+	sess.recordFile(rec)
+	got := sess.Files()
 	if len(got) != 1 || got[0].Name != "data.csv" || got[0].ObjectKey != "uploads/s/t-data.csv" || got[0].Size != 7 {
-		t.Fatalf("uploads: %+v", got)
+		t.Fatalf("files: %+v", got)
 	}
 	// A second record sorts by name.
-	sess.recordUpload(agent.UploadRecord{Name: "a.txt", ObjectKey: "k2"})
-	got = sess.Uploads()
+	sess.recordFile(agent.FileRecord{Name: "a.txt", ObjectKey: "k2"})
+	got = sess.Files()
 	if len(got) != 2 || got[0].Name != "a.txt" || got[1].Name != "data.csv" {
-		t.Fatalf("sorted uploads: %+v", got)
+		t.Fatalf("sorted files: %+v", got)
 	}
 }
 

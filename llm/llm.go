@@ -441,23 +441,23 @@ func consumeStream(ctx context.Context, r io.Reader, onEvent func(Event)) (Messa
 				if reasoning != "" {
 					emit(onEvent, Event{Type: EventReasoning, Text: reasoning})
 				}
-			for _, tc := range delta.ToolCalls {
-				// A negative index is malformed; skipping beats
-				// misordering the assembled calls below.
-				if tc.Index < 0 {
-					continue
+				for _, tc := range delta.ToolCalls {
+					// A negative index is malformed; skipping beats
+					// misordering the assembled calls below.
+					if tc.Index < 0 {
+						continue
+					}
+					acc := toolCalls[tc.Index]
+					if acc == nil {
+						acc = &toolCallAccumulator{}
+						toolCalls[tc.Index] = acc
+					}
+					if tc.ID != "" {
+						acc.id = tc.ID
+					}
+					acc.name.WriteString(tc.Function.Name)
+					acc.arguments.WriteString(tc.Function.Arguments)
 				}
-				acc := toolCalls[tc.Index]
-				if acc == nil {
-					acc = &toolCallAccumulator{}
-					toolCalls[tc.Index] = acc
-				}
-				if tc.ID != "" {
-					acc.id = tc.ID
-				}
-				acc.name.WriteString(tc.Function.Name)
-				acc.arguments.WriteString(tc.Function.Arguments)
-			}
 			}
 		}
 		// Blank lines, comments ("..."), and other SSE fields are ignored.

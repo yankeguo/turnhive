@@ -12,9 +12,9 @@ import (
 	"github.com/yankeguo/turnhive/llm"
 )
 
-// ErrBusy is returned by RunTurn when a turn is already running on the
+// ErrTurnBusy is returned by RunTurn when a turn is already running on the
 // Loop.
-var ErrBusy = errors.New("agent: a turn is already running")
+var ErrTurnBusy = errors.New("agent: a turn is already running")
 
 // maxTurnSteps bounds the step loop of one turn: each assistant reply
 // with tool calls counts as one step.
@@ -155,10 +155,10 @@ func (l *Loop) Messages() []llm.Message {
 }
 
 // RunTurn runs one user turn to completion, streaming progress through r.
-// Concurrent RunTurn calls fail immediately with ErrBusy.
+// Concurrent RunTurn calls fail immediately with ErrTurnBusy.
 func (l *Loop) RunTurn(ctx context.Context, userText string, r Reporter) error {
 	if !l.busy.CompareAndSwap(false, true) {
-		return ErrBusy
+		return ErrTurnBusy
 	}
 	defer l.busy.Store(false)
 

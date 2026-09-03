@@ -10,8 +10,9 @@
 //	stream, err := cli.Events(ctx, sess.ID, 0)
 //	defer stream.Close()
 //	for event := range stream.Events() {
-//		// handle event.Type: delta / reasoning_delta / tool_call / done / error
-//		// event.TurnID == turnID identifies events of the turn just started
+//		// handle event.Type: sync / turn_started / delta / reasoning_delta /
+//		// tool_call / turn_finished; event.TurnID == turnID identifies events
+//		// of the turn just started
 //	}
 package turnhive
 
@@ -288,9 +289,10 @@ func (c *Client) GetSession(ctx context.Context, sessionID string) (SessionDetai
 }
 
 // CancelTurn interrupts the session's running turn and returns its id.
-// The turn is aborted (its partial reply is persisted and an error event
-// is streamed); to continue, send a new message — an interrupted turn is
-// never replayed or resumed.
+// The turn is aborted (its partial reply is persisted and a
+// turn_finished event with the cancelled status is streamed); to
+// continue, send a new message — an interrupted turn is never replayed
+// or resumed.
 func (c *Client) CancelTurn(ctx context.Context, sessionID string) (string, error) {
 	var resp struct {
 		TurnID string `json:"turn_id"`

@@ -1,0 +1,170 @@
+# Local e2e deployment of turnhive on the local k3s cluster (see
+# local-k3s skill). Two replicas exercise cluster routing: sessions
+# created on one node are served through the other via etcd discovery
+# and the X-Turnhive-Forwarded reverse proxy.
+#
+# Prerequisites on the host: local-etcd (127.0.0.1:2379), local-s3
+# (RustFS, reached as 192.168.1.133:9000 from a Pod), local-ironhive
+# (192.168.1.133:30173 NodePort).
+#
+# Build and deploy:
+#   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build/turnhive ./cmd/turnhive
+#   sudo docker build -t 127.0.0.1:5000/turnhive:dev .
+#   sudo docker push 127.0.0.1:5000/turnhive:dev
+#   sudo kubectl apply -f deploy/k3s-e2e.yml
+# Verify:
+#   curl -s http://127.0.0.1:18080/healthz
+#
+# Teardown:
+#   sudo kubectl delete namespace turnhive-e2e
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: turnhive-e2e
+---
+# NOTE: dev credentials for the local RustFS, same trust domain as
+# config.yml (gitignored) — never reuse this manifest outside the local
+# single-node setup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: turnhive
+  namespace: turnhive-e2e
+data:
+  config.yml: |
+    listen: ":8080"
+
+    node:
+      # A stable identity per Pod; the entrypoint substitutes __POD_NAME__
+      # / __POD_IP__ (ConfigMaps do not expand $(VAR) references). The
+      # Pod IP is used for advertise: cluster DNS is unreliable on this
+      # host (the TUN-mode proxy hijacks it), while Pod IPs route
+      # directly.
+      id: "__POD_NAME__"
+      advertise: "http://__POD_IP__:8080"
+
+    s3:
+      # Pod-reachable address of the host RustFS (127.0.0.1 inside a Pod
+      # is the Pod itself).
+      endpoint: "192.168.1.133:9000"
+      region: us-east-1
+      bucket: turnhive
+      access_key_id: "a3b6e3a02f661c3389d7"
+      secret_access_key: "7IB+gH6HYXVMGZmwHjE8RPMLgHJTp+a1"
+      use_ssl: false
+      force_path_style: true
+      prefix: turnhive-e2e
+
+    etcd:
+      # Host etcd only listens on 127.0.0.1:2379; port 12379 on the LAN
+      # address is DNAT'd to it (see AGENTS.local.md / local-etcd).
+      endpoints: ["http://192.168.1.133:12379"]
+      dial_timeout: 5s
+      prefix: turnhive-e2e
+      lease_ttl: 10s
+
+    ironhive:
+      url: "http://192.168.1.133:30173"
+      lease: 5m
+
+    session:
+      # Short timeouts so the e2e can watch idle reaping and cold
+      # eviction happen.
+      idle_timeout: 1m
+      cold_timeout: 3m
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: turnhive
+  namespace: turnhive-e2e
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: turnhive
+  template:
+    metadata:
+      labels:
+        app: turnhive
+    spec:
+      # Give the previous Pod time to release its etcd lease before the
+      # replacement registers the same identity.
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: turnhive
+          image: 127.0.0.1:5000/turnhive:e2e-112106
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Pods cannot reach the external LLM endpoint directly (the
+            # host's TUN-mode proxy does not route Pod-originated
+            # traffic); 17897 on the LAN address is DNAT'd to the host's
+            # mihomo mixed port (see AGENTS.local.md).
+            - name: HTTPS_PROXY
+              value: "http://192.168.1.133:17897"
+            - name: HTTP_PROXY
+              value: "http://192.168.1.133:17897"
+            - name: NO_PROXY
+              value: "127.0.0.1,192.168.1.133,.svc.cluster.local,10.42.0.0/16"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              sed -e "s/__POD_NAME__/$POD_NAME/g" -e "s/__POD_IP__/$POD_IP/g" /etc/turnhive/config.yml > /tmp/config.yml
+              exec /usr/bin/turnhive -config /tmp/config.yml
+          volumeMounts:
+            - name: config
+              mountPath: /etc/turnhive
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: turnhive
+---
+# Headless Service: every Pod gets a stable DNS record
+# <pod>.turnhive.turnhive-e2e.svc.cluster.local, which is what nodes
+# advertise to each other for cross-node request forwarding.
+apiVersion: v1
+kind: Service
+metadata:
+  name: turnhive
+  namespace: turnhive-e2e
+spec:
+  clusterIP: None
+  selector:
+    app: turnhive
+  ports:
+    - name: http
+      port: 8080
+---
+# Host entry point for the e2e client.
+apiVersion: v1
+kind: Service
+metadata:
+  name: turnhive-np
+  namespace: turnhive-e2e
+spec:
+  type: NodePort
+  selector:
+    app: turnhive
+  ports:
+    - name: http
+      port: 8080
+      nodePort: 30808

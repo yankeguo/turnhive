@@ -31,6 +31,9 @@ go.work.sum
 config.yml
 .tmp/
 
+# image build output (see Dockerfile)
+build/
+
 # local reference projects and local agent docs (deliberately untracked)
 refs/
 AGENTS.local.md

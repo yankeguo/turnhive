@@ -379,8 +379,8 @@ func TestLoopBusy(t *testing.T) {
 	go func() { first <- l.RunTurn(context.Background(), "one", &fakeReporter{}) }()
 	<-entered
 
-	if err := l.RunTurn(context.Background(), "two", &fakeReporter{}); !errors.Is(err, ErrBusy) {
-		t.Fatalf("expected ErrBusy, got %v", err)
+	if err := l.RunTurn(context.Background(), "two", &fakeReporter{}); !errors.Is(err, ErrTurnBusy) {
+		t.Fatalf("expected ErrTurnBusy, got %v", err)
 	}
 	close(release)
 	if err := <-first; err != nil {

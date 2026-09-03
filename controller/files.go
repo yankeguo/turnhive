@@ -7,15 +7,16 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/yankeguo/turnhive/agent"
 	"github.com/yankeguo/turnhive/storage"
 )
 
-// uploadsNameCountCap bounds how many distinct files one session
+// filesNameCountCap bounds how many distinct files one session
 // carries, so the manifest and the sync frame stay small.
-const uploadsNameCountCap = 64
+const filesNameCountCap = 64
 
 // filesInjectTimeout bounds the injection of newly attached files into a
 // live sandbox.
@@ -31,8 +32,8 @@ func filesManifestObjectKey(sessionID string) string {
 }
 
 // writeFilesManifest persists the session's files manifest.
-func writeFilesManifest(ctx context.Context, s adoptionStore, sessionID string, uploads []agent.UploadRecord) error {
-	data, err := json.Marshal(uploads)
+func writeFilesManifest(ctx context.Context, s adoptionStore, sessionID string, files []agent.FileRecord) error {
+	data, err := json.Marshal(files)
 	if err != nil {
 		return fmt.Errorf("marshal files manifest: %w", err)
 	}
@@ -45,7 +46,7 @@ func writeFilesManifest(ctx context.Context, s adoptionStore, sessionID string, 
 // loadFilesManifest reads a session's files manifest; a missing manifest
 // is an empty set, not an error (sessions created before files existed,
 // or that never received one).
-func loadFilesManifest(ctx context.Context, s adoptionStore, sessionID string) (map[string]agent.UploadRecord, error) {
+func loadFilesManifest(ctx context.Context, s adoptionStore, sessionID string) (map[string]agent.FileRecord, error) {
 	data, err := s.GetObject(ctx, filesManifestObjectKey(sessionID))
 	if errors.Is(err, storage.ErrNotExist) {
 		return nil, nil
@@ -53,12 +54,12 @@ func loadFilesManifest(ctx context.Context, s adoptionStore, sessionID string) (
 	if err != nil {
 		return nil, err
 	}
-	var uploads []agent.UploadRecord
-	if err = json.Unmarshal(data, &uploads); err != nil {
+	var records []agent.FileRecord
+	if err = json.Unmarshal(data, &records); err != nil {
 		return nil, fmt.Errorf("parse files manifest: %w", err)
 	}
-	out := make(map[string]agent.UploadRecord, len(uploads))
-	for _, u := range uploads {
+	out := make(map[string]agent.FileRecord, len(records))
+	for _, u := range records {
 		out[u.Name] = u
 	}
 	return out, nil
@@ -69,6 +70,46 @@ type AddFilesRequest struct {
 	// Files are the user-provided files to attach; each is an object key
 	// in the shared S3 bucket (the caller puts the object itself).
 	Files []FileRef `json:"files"`
+}
+
+// FileRef references one user-provided file stored in the shared S3
+// bucket. The caller puts the object itself; turnhive only ever moves
+// the bytes between the bucket and the sandbox (via presigned URLs).
+type FileRef struct {
+	// Name is the base file name inside the sandbox
+	// (".agents/uploads/<name>"); it must match
+	// agent.FileNamePattern and be unique within the session.
+	Name string `json:"name"`
+	// ObjectKey is the S3 object key of the file, relative to the
+	// configured bucket prefix (same convention as SkillSpec.ObjectKey).
+	ObjectKey string `json:"object_key"`
+	// Size is the file size in bytes as declared by the caller
+	// (informational).
+	Size int64 `json:"size,omitempty"`
+}
+
+// validateFileRefs checks a files list.
+func validateFileRefs(files []FileRef) error {
+	seen := make(map[string]bool, len(files))
+	for i, f := range files {
+		if !agent.FileNamePattern.MatchString(f.Name) {
+			return fmt.Errorf("files[%d].name must match %s (a plain base name, no path components)", i, agent.FileNamePattern)
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("files[%d].name %q duplicates an earlier file", i, f.Name)
+		}
+		seen[f.Name] = true
+		if strings.TrimSpace(f.ObjectKey) == "" {
+			return fmt.Errorf("files[%d].object_key is required", i)
+		}
+		if strings.Contains(f.ObjectKey, "..") {
+			return fmt.Errorf("files[%d].object_key must not contain \"..\"", i)
+		}
+		if f.Size < 0 {
+			return fmt.Errorf("files[%d].size must not be negative", i)
+		}
+	}
+	return nil
 }
 
 // handleCreateFiles attaches user-provided files to the session: the
@@ -105,9 +146,9 @@ func (c *Controller) handleCreateFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	sess := v.(*Session)
 
-	records := make([]agent.UploadRecord, 0, len(req.Files))
+	records := make([]agent.FileRecord, 0, len(req.Files))
 	for _, f := range req.Files {
-		records = append(records, agent.UploadRecord{
+		records = append(records, agent.FileRecord{
 			Name:      f.Name,
 			ObjectKey: f.ObjectKey,
 			Size:      f.Size,
@@ -131,7 +172,7 @@ func (c *Controller) handleCreateFiles(w http.ResponseWriter, r *http.Request) {
 	// Persist the manifest so adoption restores the files. Best-effort
 	// like history saves: the in-memory state is authoritative, and a
 	// failed write only degrades crash recovery (logged).
-	if err := writeFilesManifest(r.Context(), c.store, id, sess.Uploads()); err != nil {
+	if err := writeFilesManifest(r.Context(), c.store, id, sess.Files()); err != nil {
 		log.Printf("session %s: write files manifest: %v", id, err)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
@@ -147,7 +188,7 @@ var (
 	errTooManyFiles = errors.New("too many files")
 )
 
-// attachFiles records the uploads and, when the session holds a live
+// attachFiles records the files and, when the session holds a live
 // sandbox, injects them into it first, so a message sent after the
 // attach always finds the files on disk. filesMu is held across the
 // sandbox check and the injection: a concurrent detach (idle reap, cold
@@ -155,7 +196,7 @@ var (
 // the record waits for the next build) or after it (the injection
 // landed; the record is also persisted for the next build), but never
 // in between, which would accept a file into no sandbox at all.
-func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []agent.UploadRecord) error {
+func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []agent.FileRecord) error {
 	sess.filesMu.Lock()
 	defer sess.filesMu.Unlock()
 	if sess.isClosed() {
@@ -163,7 +204,7 @@ func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []a
 	}
 	if sb, ok := sess.liveSandbox(); ok {
 		injectCtx, cancel := context.WithTimeout(ctx, filesInjectTimeout)
-		err := agent.InjectUploads(injectCtx, sb, c.uploadStore, records, agent.UploadURLTTL)
+		err := agent.InjectFiles(injectCtx, sb, c.fileStore, records, agent.PresignURLTTL)
 		cancel()
 		if err != nil {
 			return err
@@ -173,7 +214,7 @@ func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []a
 	// *before* recording, so a rejected request leaves no partial state.
 	// Distinct names count; re-attaching an existing name replaces it.
 	known := make(map[string]bool)
-	for _, u := range sess.Uploads() {
+	for _, u := range sess.Files() {
 		known[u.Name] = true
 	}
 	added := 0
@@ -182,11 +223,11 @@ func (c *Controller) attachFiles(ctx context.Context, sess *Session, records []a
 			added++
 		}
 	}
-	if len(known)+added > uploadsNameCountCap {
-		return fmt.Errorf("%w (limit %d)", errTooManyFiles, uploadsNameCountCap)
+	if len(known)+added > filesNameCountCap {
+		return fmt.Errorf("%w (limit %d)", errTooManyFiles, filesNameCountCap)
 	}
 	for _, u := range records {
-		sess.recordUpload(u)
+		sess.recordFile(u)
 	}
 	return nil
 }
@@ -199,7 +240,7 @@ type SessionDetail struct {
 	// TurnID is the currently running turn ("" when idle).
 	TurnID string `json:"turn_id"`
 	// Files are the user-provided files attached to the session.
-	Files []agent.UploadRecord `json:"files"`
+	Files []agent.FileRecord `json:"files"`
 	// Persisted are the files the session persisted via the persist
 	// tool.
 	Persisted []agent.PersistedObject `json:"persisted"`
@@ -222,7 +263,7 @@ func (c *Controller) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SessionDetail{
 		ID:        id,
 		TurnID:    sess.TurnID(),
-		Files:     sess.Uploads(),
+		Files:     sess.Files(),
 		Persisted: sess.Persisted(),
 	})
 }

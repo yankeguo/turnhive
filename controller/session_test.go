@@ -211,7 +211,7 @@ func TestTakeSandboxIfIdle(t *testing.T) {
 	if sb == nil || stop == nil {
 		t.Fatal("idle session with no turn must be reaped")
 	}
-	if sess.hasSandbox() {
+	if _, ok := sess.liveSandbox(); ok {
 		t.Fatal("sandbox must be detached after reap")
 	}
 	// Nothing left to reap.
@@ -251,7 +251,7 @@ func TestTakeSandboxIfIdleRace(t *testing.T) {
 			if sb == nil {
 				continue
 			}
-			if sess.hasSandbox() {
+			if _, ok := sess.liveSandbox(); ok {
 				t.Error("sandbox still attached after reap")
 			}
 			sess.setSandbox(sb, stopFn)
@@ -273,7 +273,7 @@ func TestSetSandboxAfterClose(t *testing.T) {
 	if sess.setSandbox(&ironhive.Sandbox{Name: "sb2"}, func() {}) {
 		t.Fatal("setSandbox must refuse a closed session")
 	}
-	if sess.hasSandbox() {
+	if _, ok := sess.liveSandbox(); ok {
 		t.Fatal("closed session must not hold a sandbox")
 	}
 	if sb, stop := sess.closeSession(); sb != nil || stop != nil {
@@ -392,7 +392,7 @@ func TestTakeIfCold(t *testing.T) {
 	if !cold || sb == nil || stop == nil {
 		t.Fatalf("expected eviction with sandbox and renew func, got %v %v %v", sb, stop, cold)
 	}
-	if sess.hasSandbox() {
+	if _, ok := sess.liveSandbox(); ok {
 		t.Fatal("sandbox must be detached after eviction")
 	}
 	// A second eviction attempt reports false (already closed).
